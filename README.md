@@ -1,2 +1,2 @@
 # HackTheBox-CTF
-Hackthebox üzerinden çözdüğüm ctflerin writeup.
+Hackthebox üzerinden çözdüğüm ücretsiz ctflerin writeup.
